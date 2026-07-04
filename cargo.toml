@@ -1,0 +1,21 @@
+[package]
+name = "clipout"
+version = "0.2.0"
+edition = "2021"
+
+[[bin]]
+name = "clipout"
+path = "src/main.rs"
+
+# clipout is auto-discovered from src/bin/clipout.rs — no [[bin]] entry needed.
+
+[dependencies]
+winapi = { version = "0.3", features = ["winuser", "winbase", "minwindef", "windef", "shellapi"] }
+glob = "0.3"
+atty = "0.2"
+
+[profile.release]
+lto = true
+codegen-units = 1
+strip = true
+opt-level = 3
