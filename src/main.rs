@@ -14,9 +14,6 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::{self, Command};
 
-// ===========================================================================
-// Clipboard read bindings (winapi)
-// ===========================================================================
 mod clipboard {
     use std::os::windows::ffi::OsStringExt;
     use std::ptr;
@@ -33,8 +30,6 @@ mod clipboard {
     pub const CF_DIB: u32 = 8;
     pub const CF_DIBV5: u32 = 17;
 
-    // IsClipboardFormatAvailable reports synthesizable formats too (e.g. CF_BITMAP
-    // when only CF_DIB is present), so a single query answers "is X pasteable".
     pub fn has_format(fmt: u32) -> bool {
         unsafe { IsClipboardFormatAvailable(fmt) != 0 }
     }
@@ -102,9 +97,6 @@ mod clipboard {
     }
 }
 
-// ===========================================================================
-// Image format resolution (port of Get-ImageFormat)
-// ===========================================================================
 mod imgutil {
     use std::path::Path;
 
@@ -134,8 +126,6 @@ mod imgutil {
         }
     }
 
-    // Returns (System.Drawing.Imaging.ImageFormat name, mime, ext). --fmt wins, then
-    // path extension, else PNG default — identical precedence to the PowerShell.
     pub fn resolve_format(path: &str, fmt_override: Option<&str>) -> (&'static str, String, String) {
         if let Some(o) = fmt_override {
             let o = o.to_lowercase();
@@ -152,41 +142,65 @@ mod imgutil {
     }
 }
 
-// ===========================================================================
-// LLM fenced-block parser (port of ConvertFrom-LlmBundle)
-// ===========================================================================
 mod bundle {
     pub struct Rec {
         pub name: String,
         pub content: String,
     }
 
-    // Content rejoined with CRLF, matching PS Environment.NewLine. Deviation from PS:
-    // written WITHOUT a UTF-8 BOM (PS 5.1 [Text.Encoding]::UTF8 emits one) — see flags.
-    pub fn parse(text: &str, fence: &str) -> Vec<Rec> {
-        let lines: Vec<&str> = text
-            .split('\n')
-            .map(|l| l.strip_suffix('\r').unwrap_or(l))
-            .collect();
-        let mut items = Vec::new();
-        let mut in_block = false;
-        let mut start = 0usize;
-        let mut name = String::new();
-        let mut i = 0usize;
-        while i < lines.len() {
-            let trimmed = lines[i].trim();
-            if !in_block && trimmed.starts_with(fence) {
-                in_block = true;
-                name = if i > 0 {
-                    lines[i - 1].trim().to_string()
-                } else {
-                    String::new()
-                };
-                start = i + 1;
-                i += 1;
-                continue;
+   pub fn parse(text: &str, fence: &str) -> Vec<Rec> {
+    let lines: Vec<&str> = text
+        .split('\n')
+        .map(|l| l.strip_suffix('\r').unwrap_or(l))
+        .collect();
+
+    let fence_char = fence.chars().next().unwrap_or('`');
+
+    let mut items = Vec::new();
+    let mut in_block = false;
+    let mut start = 0usize;
+    let mut name = String::new();
+    let mut open_len = 0usize;
+    let mut i = 0usize;
+
+    while i < lines.len() {
+        let trimmed = lines[i].trim();
+
+        // ------------------------------------------------------------
+        // ENTER BLOCK
+        // ------------------------------------------------------------
+        if !in_block && trimmed.starts_with(fence) {
+            in_block = true;
+            open_len = trimmed.chars().take_while(|&c| c == fence_char).count();
+
+            // Filename is the single line immediately preceding the fence.
+            let raw = if i > 0 { lines[i - 1].trim().to_string() } else { String::new() };
+
+            let mut n = raw;
+            while n.starts_with('#') {
+                n = n.trim_start_matches('#').trim().to_string();
             }
-            if in_block && trimmed == fence {
+            n = n.replace('`', "");
+
+            if !n.contains('.') && !n.contains('/') && !n.contains('\\') {
+                n = format!("file_{}.txt", items.len());
+            }
+
+            name = n;
+            start = i + 1;
+            i += 1;
+            continue;
+        }
+
+        // ------------------------------------------------------------
+        // EXIT BLOCK — a pure run of the fence char, length >= the
+        // opening run. A shorter run (e.g. a ``` example nested inside
+        // a ```` wrapper) is content, not a close.
+        // ------------------------------------------------------------
+        if in_block {
+            let run = trimmed.chars().take_while(|&c| c == fence_char).count();
+            let is_pure_close = run > 0 && run == trimmed.chars().count() && run >= open_len;
+            if is_pure_close {
                 let content = lines[start..i].join("\r\n");
                 items.push(Rec {
                     name: name.clone(),
@@ -194,18 +208,20 @@ mod bundle {
                 });
                 in_block = false;
             }
-            i += 1;
         }
-        if in_block {
-            eprintln!("Warning: bundle ended inside a fenced block; content may be truncated.");
-        }
-        items
+
+        i += 1;
     }
+
+    if in_block {
+        eprintln!("Warning: bundle ended inside a fenced block; content may be truncated.");
+    }
+
+    items
 }
 
-// ===========================================================================
-// Flags
-// ===========================================================================
+}
+
 #[derive(Default)]
 struct Cfg {
     force_image: bool,
@@ -229,8 +245,8 @@ fn parse() -> Cfg {
             "--i" | "--image" => c.force_image = true,
             "--b64" | "--b" => c.as_b64 = true,
             "--data" | "--d" => c.as_data = true,
-            "--files" | "--file" | "--f" => {} // auto-detected; accepted as no-op (PS parity)
-            "--llm" | "--l" => c.from_llm = true,
+            "--files" | "--file" | "--f" => {}
+            "--llm" | "--l" | "-llm" | "-l" => c.from_llm = true,
             "--t" | "--trace" => c.trace = true,
             "--h" | "--help" => c.help = true,
             s if s.starts_with("--fmt:") => c.fmt = Some(s[6..].to_lowercase()),
@@ -246,9 +262,41 @@ fn parse() -> Cfg {
     c
 }
 
-// ===========================================================================
-// Helpers
-// ===========================================================================
+fn preview_llm_items(items: &[bundle::Rec]) {
+    use std::io::{self, Write};
+
+    const MAX_LINES: usize = 3;
+    const MAX_CHARS: usize = 120;
+
+    const COLOR_FILE: &str = "\x1b[1;36m";
+    const COLOR_LINE: &str = "\x1b[0;33m";
+    const COLOR_RESET: &str = "\x1b[0m";
+
+    let stdout = io::stdout();
+    let mut out = stdout.lock();
+
+    for it in items {
+        writeln!(out, "{}{}{}", COLOR_FILE, it.name, COLOR_RESET).unwrap();
+
+        let lines: Vec<&str> = it
+            .content
+            .split('\n')
+            .map(|l| l.strip_suffix('\r').unwrap_or(l))
+            .collect();
+
+        for line in lines.iter().take(MAX_LINES) {
+            let mut s = line.to_string();
+            if s.len() > MAX_CHARS {
+                s.truncate(MAX_CHARS);
+                s.push_str("…");
+            }
+            writeln!(out, "  {}{}{}", COLOR_LINE, s, COLOR_RESET).unwrap();
+        }
+
+        writeln!(out).unwrap();
+    }
+}
+
 fn cwd() -> PathBuf {
     std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."))
 }
@@ -265,7 +313,6 @@ fn ensure_parent(path: &Path) {
     }
 }
 
-// Deviation: no UTF-8 BOM (PS Set-Content/WriteAllText in 5.1 prepend one). See flags.
 fn write_text(path: &Path, content: &str) -> std::io::Result<()> {
     ensure_parent(path);
     fs::write(path, content.as_bytes())
@@ -333,8 +380,6 @@ fn shim_transcode(src: &str, dest: &str, ps_fmt: &str) -> Result<(), String> {
     run_ps(&cmd)
 }
 
-// Deviation: PS Write-Trace summary always ran (its guard was commented out); here it is
-// gated behind --trace, honoring the traceEnabled flag the PS clearly intended.
 fn trace_summary(on: bool, files: &[PathBuf]) {
     if !on || files.is_empty() {
         return;
@@ -371,17 +416,14 @@ const HELP: &str = "clipout — paste clipboard contents to disk
     --fence:<chars>   Fence marker for --llm (default: ```)
 
   MODES (auto-selected)
-    clipout shot.png            Save a clipboard image
-    clipout shot.jpg --fmt:jpg  Save, converting format
-    clipout --llm               Extract every file from a bundle to cwd
-    clipout ./dest/             Paste copied files into a directory
-    clipout notes.txt           Write clipboard text to a file
-    clipout                     Echo clipboard text to the console
+    clipout shot.png
+    clipout shot.jpg --fmt:jpg
+    clipout --llm
+    clipout ./dest/
+    clipout notes.txt
+    clipout
 ";
 
-// ===========================================================================
-// Main
-// ===========================================================================
 fn main() {
     let cfg = parse();
 
@@ -397,7 +439,72 @@ fn main() {
         );
     }
 
-    // Resolve destination: default cwd; relative -> absolute against cwd.
+    {
+        let text = clipboard::get_text().unwrap_or_default();
+        if !text.trim().is_empty() {
+            let items = bundle::parse(&text, &cfg.fence);
+
+            if cfg.positional.is_none() && !items.is_empty() && !cfg.from_llm {
+                preview_llm_items(&items);
+                process::exit(0);
+            }
+
+            if cfg.from_llm {
+                let dest_path: PathBuf = match &cfg.positional {
+                    Some(p) => {
+                        let pb = PathBuf::from(p);
+                        if pb.is_absolute() {
+                            pb
+                        } else {
+                            cwd().join(pb)
+                        }
+                    }
+                    None => cwd(),
+                };
+
+                let base_dir: PathBuf = if dest_path.is_dir() {
+                    dest_path.clone()
+                } else {
+                    match dest_path.parent() {
+                        Some(p) if !p.as_os_str().is_empty() => p.to_path_buf(),
+                        _ => cwd(),
+                    }
+                };
+
+                let mut written: Vec<PathBuf> = Vec::new();
+
+                for it in &items {
+                    let name = it.name.replace('\\', "/");
+
+                    if name.starts_with("../") || name.contains("/../") {
+                        eprintln!("Skipping unsafe path: {}", name);
+                        continue;
+                    }
+
+                    let out = if Path::new(&name).is_absolute() {
+                        PathBuf::from(&name)
+                    } else {
+                        base_dir.join(&name)
+                    };
+
+                    ensure_parent(&out);
+
+                    match write_text(&out, &it.content) {
+                        Ok(()) => {
+                            println!("{}", out.display());
+                            written.push(out);
+                        }
+                        Err(e) => eprintln!("Failed {}: {}", out.display(), e),
+                    }
+                }
+
+                println!("{} file(s) written from LLM bundle.", items.len());
+                trace_summary(cfg.trace, &written);
+                process::exit(0);
+            }
+        }
+    }
+
     let mut dest_path: PathBuf = match &cfg.positional {
         Some(p) => {
             let pb = PathBuf::from(p);
@@ -412,46 +519,6 @@ fn main() {
 
     let mut written: Vec<PathBuf> = Vec::new();
 
-    // -----------------------------------------------------------------------
-    // MODE: LLM bundle (checked first, mirrors PS ordering)
-    // -----------------------------------------------------------------------
-    if cfg.from_llm {
-        let text = clipboard::get_text().unwrap_or_default();
-        if text.trim().is_empty() {
-            eprintln!("Clipboard is empty.");
-            process::exit(1);
-        }
-        let base_dir: PathBuf = if dest_path.is_dir() {
-            dest_path.clone()
-        } else {
-            match dest_path.parent() {
-                Some(p) if !p.as_os_str().is_empty() => p.to_path_buf(),
-                _ => cwd(),
-            }
-        };
-        let items = bundle::parse(&text, &cfg.fence);
-        if items.is_empty() {
-            eprintln!("No fenced blocks found in clipboard text.");
-            process::exit(1);
-        }
-        for it in &items {
-            let out = base_dir.join(&it.name);
-            match write_text(&out, &it.content) {
-                Ok(()) => {
-                    println!("{}", it.name);
-                    written.push(out);
-                }
-                Err(e) => eprintln!("Failed {}: {}", out.display(), e),
-            }
-        }
-        println!("{} file(s) written from LLM bundle.", items.len());
-        trace_summary(cfg.trace, &written);
-        process::exit(0);
-    }
-
-    // -----------------------------------------------------------------------
-    // MODE: Explorer file-drop (auto-detected)
-    // -----------------------------------------------------------------------
     if clipboard::has_format(clipboard::CF_HDROP) {
         let dropped = clipboard::get_file_drop().unwrap_or_default();
         let dest_dir: PathBuf = if dest_path.is_dir() {
@@ -462,7 +529,7 @@ fn main() {
                 _ => cwd(),
             }
         };
-        // Format override: --fmt: OR implied from destination extension (destination not a dir).
+
         let fmt_override: Option<String> = cfg.fmt.clone().or_else(|| {
             if !dest_path.is_dir() {
                 imgutil::ext_of(&dest_path.to_string_lossy())
@@ -472,14 +539,12 @@ fn main() {
         });
 
         for src in &dropped {
-            let leaf = Path::new(src)
-                .file_name()
-                .map(|n| n.to_string_lossy().to_string())
-                .unwrap_or_else(|| src.clone());
-            let base = Path::new(&leaf)
-                .file_stem()
-                .map(|n| n.to_string_lossy().to_string())
-                .unwrap_or_else(|| leaf.clone());
+            let src_path = Path::new(src);
+            let base = Path::new(&dropped[0])
+                .parent()
+                .unwrap_or_else(|| Path::new(""));
+            let rel = src_path.strip_prefix(base).unwrap_or(src_path);
+
             let src_ext = imgutil::ext_of(src);
             let is_img = imgutil::is_image(src);
 
@@ -490,36 +555,39 @@ fn main() {
                 let target_ext = fmt_override.clone().unwrap();
                 let (ps_fmt, _m, _e) =
                     imgutil::resolve_format(&format!("x.{}", target_ext), None);
-                let out = dest_dir.join(format!("{}.{}", base, target_ext));
-                ensure_parent(&out);
-                match shim_transcode(src, &out.to_string_lossy(), ps_fmt) {
+
+                let mut out2 = dest_dir.join(rel);
+                out2.set_extension(&target_ext);
+
+                ensure_parent(&out2);
+
+                match shim_transcode(src, &out2.to_string_lossy(), ps_fmt) {
                     Ok(()) => {
-                        println!("{}  (converted to {})", leaf, target_ext);
-                        written.push(out);
+                        println!("{}  (converted to {})", rel.display(), target_ext);
+                        written.push(out2);
                         continue;
                     }
                     Err(e) => eprintln!("Image conversion failed for '{}': {}", src, e),
                 }
             }
 
-            let out = dest_dir.join(&leaf);
+            let out = dest_dir.join(rel);
             ensure_parent(&out);
+
             match fs::copy(src, &out) {
                 Ok(_) => {
-                    println!("{}", leaf);
+                    println!("{}", rel.display());
                     written.push(out);
                 }
                 Err(e) => eprintln!("Copy failed for '{}': {}", src, e),
             }
         }
+
         println!("{} file(s) pasted.", dropped.len());
         trace_summary(cfg.trace, &written);
         process::exit(0);
     }
 
-    // -----------------------------------------------------------------------
-    // Image presence + directory-destination default text sink (PS skipWrite).
-    // -----------------------------------------------------------------------
     let has_img = clipboard::has_format(clipboard::CF_BITMAP)
         || clipboard::has_format(clipboard::CF_DIB)
         || clipboard::has_format(clipboard::CF_DIBV5);
@@ -530,11 +598,6 @@ fn main() {
         skip_write = true;
     }
 
-    // -----------------------------------------------------------------------
-    // MODE: Image (from clipboard). Trigger = explicit flag OR image-extension
-    // destination. Fix vs PS: null-image ops guarded; dir-destination synthesises
-    // a filename instead of crashing on Save(<directory>).
-    // -----------------------------------------------------------------------
     let explicit_image = cfg.force_image || cfg.as_b64 || cfg.as_data;
     let auto_image = imgutil::is_image(&dest_path.to_string_lossy());
     let want_image = explicit_image || auto_image;
@@ -544,8 +607,10 @@ fn main() {
             let ext = cfg.fmt.clone().unwrap_or_else(|| "png".into());
             dest_path = dest_path.join(format!("clipboard.{}", ext));
         }
+
         let (ps_fmt, mime, ext) =
             imgutil::resolve_format(&dest_path.to_string_lossy(), cfg.fmt.as_deref());
+
         ensure_parent(&dest_path);
         let dest_s = dest_path.to_string_lossy().to_string();
 
@@ -583,11 +648,9 @@ fn main() {
         process::exit(1);
     }
 
-    // -----------------------------------------------------------------------
-    // MODE: Plain text
-    // -----------------------------------------------------------------------
     if clipboard::has_format(clipboard::CF_UNICODETEXT) {
         let text = clipboard::get_text().unwrap_or_default();
+
         if !skip_write {
             match write_text(&dest_path, &text) {
                 Ok(()) => {
@@ -604,17 +667,16 @@ fn main() {
             println!("{}", text);
             println!();
         }
+
         trace_summary(cfg.trace, &written);
         process::exit(0);
     }
 
-    // -----------------------------------------------------------------------
-    // No matching format. Tailored hint when an image is present but unaddressed.
-    // -----------------------------------------------------------------------
     if has_img {
         eprintln!("Clipboard holds an image; name an output file (e.g. clipout shot.png) or pass --i.");
     } else {
         eprintln!("Clipboard does not contain text, an image, or files.");
     }
+
     process::exit(1);
 }
