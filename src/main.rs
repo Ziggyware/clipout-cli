@@ -108,11 +108,9 @@ mod imgutil {
     }
 
     pub fn is_image(path: &str) -> bool {
-        matches!(
-            ext_of(path).as_deref(),
-            Some("png") | Some("jpg") | Some("jpeg") | Some("bmp") | Some("gif")
-                | Some("tif") | Some("tiff")
-        )
+        ext_of(path)
+            .as_deref()
+            .map_or(false, |ext| matches!(ext, "png" | "jpg" | "jpeg" | "bmp" | "gif" | "tif" | "tiff"))
     }
 
     fn map(ext: &str) -> Option<(&'static str, &'static str)> {
@@ -166,9 +164,8 @@ mod bundle {
     while i < lines.len() {
         let trimmed = lines[i].trim();
 
-        // ------------------------------------------------------------
+        
         // ENTER BLOCK
-        // ------------------------------------------------------------
         if !in_block && trimmed.starts_with(fence) {
             in_block = true;
             open_len = trimmed.chars().take_while(|&c| c == fence_char).count();
@@ -180,14 +177,35 @@ mod bundle {
             while n.starts_with('#') {
                 n = n.trim_start_matches('#').trim().to_string();
             }
-            n = n.replace('`', "");
+            while n.starts_with('/') {
+                n = n.trim_start_matches('/').trim().to_string();
+            }
+            n = n.replace('`', "").trim_end_matches(':').trim().to_string();
 
-            if !n.contains('.') && !n.contains('/') && !n.contains('\\') {
-                n = format!("file_{}.txt", items.len());
+            // If no usable filename before the fence, peek at the first line inside the block.
+            if !n.contains('.') && !n.contains(' ') && !n.contains(':') {
+                if i + 1 < lines.len() {
+                    let mut can = lines[i + 1].trim().to_string();
+                    can = can.replace('`', "").trim_end_matches(':').trim().to_string();
+                    while can.starts_with('/') {
+                        can = can.trim_start_matches('/').trim().to_string();
+                    }
+                    if can.contains('.') && !can.contains(' ') && !can.contains(':'){
+                        n = can;
+                        start = i + 2; // skip the filename line itself
+                    } else {
+                        n = format!("file_{}.txt", items.len());
+                        start = i + 1;
+                    }
+                } else {
+                    n = format!("file_{}.txt", items.len());
+                    start = i + 1;
+                }
+            } else {
+                start = i + 1;
             }
 
             name = n;
-            start = i + 1;
             i += 1;
             continue;
         }
@@ -242,13 +260,13 @@ fn parse() -> Cfg {
     };
     for a in std::env::args().skip(1) {
         match a.as_str() {
-            "--i" | "--image" => c.force_image = true,
-            "--b64" | "--b" => c.as_b64 = true,
-            "--data" | "--d" => c.as_data = true,
-            "--files" | "--file" | "--f" => {}
+            "--i" | "-i" | "--image" => c.force_image = true,
+            "--b64" | "-b" | "--b" => c.as_b64 = true,
+            "--data" | "-d" | "--d" => c.as_data = true,
+            "--files" | "--file" | "-f" | "--f" => {}
             "--llm" | "--l" | "-llm" | "-l" => c.from_llm = true,
-            "--t" | "--trace" => c.trace = true,
-            "--h" | "--help" => c.help = true,
+            "--t" | "--trace" | "-t" => c.trace = true,
+            "--h" | "--help" | "-h" | "-?" | "?" => c.help = true,
             s if s.starts_with("--fmt:") => c.fmt = Some(s[6..].to_lowercase()),
             s if s.starts_with("--fence:") => c.fence = s[8..].to_string(),
             s if s.starts_with("--") => {}
@@ -262,6 +280,20 @@ fn parse() -> Cfg {
     c
 }
 
+fn add_commas(n: i64) -> String {
+    let neg = n < 0;
+    let s = n.unsigned_abs().to_string();
+    let mut out = String::new();
+    for (i, c) in s.chars().rev().enumerate() {
+        if i > 0 && i % 3 == 0 {
+            out.push(',');
+        }
+        out.push(c);
+    }
+    let result: String = out.chars().rev().collect();
+    if neg { format!("-{result}") } else { result }
+}
+
 fn preview_llm_items(items: &[bundle::Rec]) {
     use std::io::{self, Write};
 
@@ -269,14 +301,18 @@ fn preview_llm_items(items: &[bundle::Rec]) {
     const MAX_CHARS: usize = 120;
 
     const COLOR_FILE: &str = "\x1b[1;36m";
-    const COLOR_LINE: &str = "\x1b[0;33m";
+    const COLOR_LINE: &str = "\x1b[1;33m";
     const COLOR_RESET: &str = "\x1b[0m";
+    const COLOR_LENGTH: &str = "\x1b[2;37m";
+    const COLOR_LENGTH_DESC: &str = "\x1b[2;36m";
 
     let stdout = io::stdout();
     let mut out = stdout.lock();
 
+    writeln!(out, "").unwrap();
+
     for it in items {
-        writeln!(out, "{}{}{}", COLOR_FILE, it.name, COLOR_RESET).unwrap();
+        writeln!(out, "{}{}{} {}{} {}bytes{} {}{} {}lines{}", COLOR_FILE, it.name, COLOR_RESET, COLOR_LENGTH, add_commas(it.content.len() as i64), COLOR_LENGTH_DESC, COLOR_RESET, COLOR_LENGTH, add_commas(it.content.lines().count() as i64), COLOR_LENGTH_DESC, COLOR_RESET).unwrap();
 
         let lines: Vec<&str> = it
             .content
@@ -399,32 +435,38 @@ fn trace_summary(on: bool, files: &[PathBuf]) {
     }
 }
 
-const HELP: &str = "clipout — paste clipboard contents to disk
+const HELP: &str = "\x1b[1;36mclipout\x1b[0m — paste clipboard contents to disk
 
-  USAGE
+  \x1b[0;34mUSAGE\x1b[0m
     clipout [destination] [flags]
 
-  FLAGS
-    --h --help        Show this message
-    --t --trace       Verbose diagnostics + written-file summary
-    --i --image       Treat clipboard as an image
-    --b64             Write clipboard image as a Base64 text file
-    --data            Write clipboard image as an HTML Base64 data URI file
-    --files           Force file-drop handling (normally auto-detected)
-    --llm             Extract an LLM fenced-block bundle to disk
-    --fmt:<ext>       Output image format (png | jpg | bmp | gif | tif)
-    --fence:<chars>   Fence marker for --llm (default: ```)
+  \x1b[0;34mFLAGS\x1b[0m
+    \x1b[0;33m--h --help\x1b[0m        Show this message
+    \x1b[0;33m--t --trace\x1b[0m       Verbose diagnostics + written-file summary
+    \x1b[0;33m--i --image\x1b[0m       Treat clipboard as an image
+    \x1b[0;33m--b64\x1b[0m             Write clipboard image as a Base64 text file
+    \x1b[0;33m--data\x1b[0m            Write clipboard image as an HTML Base64 data URI file
+    \x1b[0;33m--files\x1b[0m           Force file-drop handling (normally auto-detected)
+    \x1b[0;33m--llm\x1b[0m             Extract an LLM fenced-block bundle to disk
+    \x1b[0;33m--fmt:<ext>\x1b[0m       Output image format (png | jpg | bmp | gif | tif)
+    \x1b[0;33m--fence:<chars>\x1b[0m   Fence marker for --llm (default: ```)
 
-  MODES (auto-selected)
-    clipout shot.png
-    clipout shot.jpg --fmt:jpg
-    clipout --llm
-    clipout ./dest/
-    clipout notes.txt
-    clipout
+  \x1b[0;34mMODES\x1b[0m (auto-selected)
+    \x1b[2;37mclipout shot.png\x1b[0m
+    \x1b[2;37mclipout shot.jpg --fmt:jpg\x1b[0m
+    \x1b[2;37mclipout --llm\x1b[0m
+    \x1b[2;37mclipout ./dest/\x1b[0m
+    \x1b[2;37mclipout notes.txt\x1b[0m
+    \x1b[2;37mclipout\x1b[0m
 ";
 
 fn main() {
+    const COLOR_ERROR: &str = "\x1b[1;31m";
+    const COLOR_WARNING: &str = "\x1b[0;33m";
+    const COLOR_RESET: &str = "\x1b[0m";
+    const COLOR_INFO: &str = "\x1b[0;34m";
+    const COLOR_TRACE: &str = "\x1b[2;3m";
+    const COLOR_DESC: &str = "\x1b[2;36m";
     let cfg = parse();
 
     if cfg.help {
@@ -434,8 +476,15 @@ fn main() {
 
     if cfg.trace {
         eprintln!(
-            "  [PARSE] llm={} b64={} data={} forceImage={} fmt={:?} fence={:?} pos={:?}",
-            cfg.from_llm, cfg.as_b64, cfg.as_data, cfg.force_image, cfg.fmt, cfg.fence, cfg.positional
+            "  {}[PARSE]{} {}llm{}={}{}{} {}b64{}={}{}{} {}data{}={}{}{} {}forceImage{}={}{}{} {}fmt{}={}{:?}{} {}fence{}={}{:?}{} {}pos{}={}{:?}{}",
+            COLOR_TRACE, COLOR_RESET,
+            COLOR_INFO, COLOR_RESET, COLOR_TRACE, cfg.from_llm, COLOR_RESET, 
+            COLOR_INFO, COLOR_RESET, COLOR_TRACE, cfg.as_b64, COLOR_RESET, 
+            COLOR_INFO, COLOR_RESET, COLOR_TRACE, cfg.as_data, COLOR_RESET, 
+            COLOR_INFO, COLOR_RESET, COLOR_TRACE, cfg.force_image, COLOR_RESET, 
+            COLOR_INFO, COLOR_RESET, COLOR_TRACE, cfg.fmt, COLOR_RESET, 
+            COLOR_INFO, COLOR_RESET, COLOR_TRACE, cfg.fence, COLOR_RESET, 
+            COLOR_INFO, COLOR_RESET, COLOR_TRACE, cfg.positional, COLOR_RESET, 
         );
     }
 
@@ -476,8 +525,11 @@ fn main() {
                 for it in &items {
                     let name = it.name.replace('\\', "/");
 
-                    if name.starts_with("../") || name.contains("/../") {
-                        eprintln!("Skipping unsafe path: {}", name);
+                    if name.starts_with("../") || name.contains("/../") || name.contains(":") {
+                        eprintln!("{}Skipping unsafe path{}: {}{}{}", 
+                            COLOR_WARNING,
+                            COLOR_RESET,
+                            COLOR_INFO, name, COLOR_RESET);
                         continue;
                     }
 
@@ -494,11 +546,19 @@ fn main() {
                             println!("{}", out.display());
                             written.push(out);
                         }
-                        Err(e) => eprintln!("Failed {}: {}", out.display(), e),
+                        Err(e) => eprintln!("{}Failed {}{}{}: {}{}{}", 
+                            COLOR_ERROR, 
+                            COLOR_INFO, out.display(), COLOR_RESET,
+                            COLOR_INFO, e, COLOR_RESET),
                     }
                 }
 
-                println!("{} file(s) written from LLM bundle.", items.len());
+                println!("{}{} file(s) written{} {}LLM bundle{}.",
+                    COLOR_DESC,
+                    items.len(),
+                    COLOR_RESET,
+                    COLOR_INFO,
+                    COLOR_RESET);
                 trace_summary(cfg.trace, &written);
                 process::exit(0);
             }
@@ -563,11 +623,11 @@ fn main() {
 
                 match shim_transcode(src, &out2.to_string_lossy(), ps_fmt) {
                     Ok(()) => {
-                        println!("{}  (converted to {})", rel.display(), target_ext);
+                        println!("{}  ({}converted to {}{})", rel.display(), COLOR_DESC, target_ext, COLOR_RESET);
                         written.push(out2);
                         continue;
                     }
-                    Err(e) => eprintln!("Image conversion failed for '{}': {}", src, e),
+                    Err(e) => eprintln!("{}Image conversion failed for '{}': {}{}", COLOR_ERROR, src, e, COLOR_RESET),
                 }
             }
 
@@ -579,11 +639,11 @@ fn main() {
                     println!("{}", rel.display());
                     written.push(out);
                 }
-                Err(e) => eprintln!("Copy failed for '{}': {}", src, e),
+                Err(e) => eprintln!("{}Copy failed for '{}': {}{}", COLOR_ERROR, src, e, COLOR_RESET),
             }
         }
 
-        println!("{} file(s) pasted.", dropped.len());
+        println!("{}{} file(s) pasted.{}", COLOR_DESC, dropped.len(), COLOR_RESET);
         trace_summary(cfg.trace, &written);
         process::exit(0);
     }
