@@ -2,14 +2,14 @@
 //! Sibling to clipin. Reads the Windows clipboard and writes it to disk.
 //!
 //! Placement:  src/bin/clipout.rs   (alongside src/main.rs = clipin)
-//! Build:      cargo build --release      -> target/release/clipout.exe
+//! Build:      cargo build --release -> target/release/clipout.exe
 //! Cargo.toml: winapi features must include winuser, winbase, shellapi, windef, minwindef
 //!
 //! Native paths : text write / echo, LLM-bundle extract, file-drop copy + transcode.
 //! Shim paths   : clipboard-IMAGE extraction (raw save / base64 / data-uri) via a single
 //!                STA PowerShell one-liner — mirrors clipin's raw-image shim, because
 //!                CF_DIB -> encodable-bitmap reconstruction in pure winapi is ~200 LOC.
-
+//! test
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::{self, Command};
@@ -269,6 +269,10 @@ fn parse() -> Cfg {
                 if let Some(target) = args.peek() {
                     c.diff_target = Some(target.clone());
                     args.next();
+                }
+                else {
+                    eprintln!("Error: /diff requires a target file argument.");
+                    process::exit(1);
                 }
             }
             "/image" | "/i" | "--i" | "-i" | "--image" => c.force_image = true,
@@ -879,6 +883,18 @@ fn unified_diff(name: &str, clip: &str, disk: &Path, max_changes: usize) {
     let edits = diff_lines(&a, &b);
     let hunks = build_hunks(&edits, 3);
 
+    println!("disk lines : {}", a.len());
+    println!("clip lines : {}", b.len());
+
+    println!("edits      : {}", edits.len());
+
+    println!(
+        "changes    : {}",
+        edits.iter().filter(|e| is_change(e)).count()
+    );
+
+    println!("hunks      : {}", hunks.len());
+
     colorize_diff(name, &a, &b, &disk_content, clip, &hunks, max_changes);
 }
 
@@ -1082,14 +1098,27 @@ fn main() {
         let items = bundle::parse_fence(&text, &cfg.fence);
 
         if items.is_empty() {
-            eprintln!("Clipboard does not contain text to diff.");
-            process::exit(1);
-        }
+            let target = match &cfg.diff_target {
+                Some(p) => PathBuf::from(p),
+                None => {
+                    eprintln!("clipout /diff requires a target file when clipboard is plain text.");
+                    process::exit(1);
+                }
+            };
 
-        for it in &items {
-            unified_diff(&it.name, &it.content, Path::new(&it.name), 100);
+            unified_diff(
+                target.file_name()
+                    .unwrap_or_default()
+                    .to_string_lossy()
+                    .as_ref(),
+                &text,
+                &target,
+                100,
+            );
+
+            process::exit(0);
         }
-        process::exit(0);
+        
     }
 
     {
