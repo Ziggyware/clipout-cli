@@ -258,14 +258,25 @@ fn parse() -> Cfg {
         ..Default::default()
     };
 
-    let mut args = std::env::args().skip(1).peekable();
-    for a in std::env::args().skip(1) {
-        match a.as_str() {
+    // Single Vec + manual index, not two independent iterators over
+    // std::env::args(). The previous version created a second, separate
+    // `.peekable()` iterator alongside the for-loop's own — two unrelated
+    // cursors into argv that never stayed in sync. peek()/next() on the
+    // separate iterator always read ONE STEP BEHIND the for-loop's
+    // position (it hadn't been advanced past the current token yet), so
+    // `clipout /diff foo` captured "/diff" itself as diff_target instead
+    // of "foo", and "foo" then fell through to become cfg.positional.
+    let argv: Vec<String> = std::env::args().skip(1).collect();
+    let mut i = 0usize;
+
+    while i < argv.len() {
+        let a = argv[i].as_str();
+        match a {
             "/diff" | "--diff" => {
                 c.diff = true;
-                if let Some(target) = args.peek() {
+                if let Some(target) = argv.get(i + 1) {
                     c.diff_target = Some(target.clone());
-                    args.next();
+                    i += 1;
                 } else {
                     eprintln!("Error: /diff requires a target file argument.");
                     process::exit(1);
@@ -287,6 +298,7 @@ fn parse() -> Cfg {
                 }
             }
         }
+        i += 1;
     }
     c
 }
@@ -918,19 +930,72 @@ fn main() {
     // ===================================================================
     // Diff mode
     //
-    // Plain-text clipboard: diff clipboard text directly against
-    // cfg.diff_target (required).
+    // Precedence, most to least specific:
+    //   1. cfg.diff_target names a FILE (exists as a file, or doesn't exist
+    //      yet but isn't shaped like a directory) -> explicit target always
+    //      wins. Diff the RAW clipboard text against exactly that file,
+    //      even if the clipboard happens to parse as a fenced bundle. The
+    //      user named one file; that's authoritative over fence detection.
+    //   2. Clipboard parses as a fenced bundle AND target is absent or is a
+    //      directory -> diff EACH bundled file against its same-named
+    //      counterpart on disk, resolved under that directory (or cwd if
+    //      no target given).
+    //   3. Plain-text clipboard, target given -> diff clipboard text
+    //      against that file (subsumed by case 1, kept here as the
+    //      required-target error path when no target is given at all).
     //
-    // Fenced bundle on clipboard: diff EACH bundled file against its
-    // same-named counterpart on disk. Base dir resolves the same way
-    // --llm resolves its write target: cfg.diff_target if given (as a
-    // directory, or as a file whose parent is used), else cwd. This was
-    // previously a silent no-op — a bundle on the clipboard produced zero
-    // output and exit 0, which is worse than an error because it looks
-    // like "no changes" rather than "didn't run".
+    // Case 2 was previously a silent no-op (bundle on clipboard produced
+    // zero output, exit 0 — indistinguishable from "no changes"). Case 1
+    // was previously unreachable: any bundle-shaped clipboard content
+    // silently overrode an explicitly named single-file target, which
+    // looked like "the file argument does nothing" from the outside.
     // ===================================================================
     if cfg.diff {
         let text = clipboard::get_text().unwrap_or_default();
+
+        // Does the named target look like a file, not a directory? An
+        // existing directory, or a path ending in a separator, is treated
+        // as a directory (bundle base dir); everything else — including a
+        // not-yet-existing path — is treated as a file target, matching
+        // how every other command in this tool infers file-vs-dir intent
+        // from the argument shape rather than requiring the path to exist.
+        let target_is_file = match &cfg.diff_target {
+            Some(p) => {
+                let looks_like_dir = p.ends_with('/') || p.ends_with('\\');
+                let pb = if Path::new(p).is_absolute() {
+                    PathBuf::from(p)
+                } else {
+                    cwd().join(p)
+                };
+                !looks_like_dir && !pb.is_dir()
+            }
+            None => false,
+        };
+
+        if target_is_file {
+            // Case 1: explicit file target always wins, bundle parsing
+            // is bypassed entirely — diff raw clipboard text as-is.
+            let p = cfg.diff_target.as_ref().unwrap();
+            let target = if Path::new(p).is_absolute() {
+                PathBuf::from(p)
+            } else {
+                cwd().join(p)
+            };
+
+            unified_diff(
+                target
+                    .file_name()
+                    .unwrap_or_default()
+                    .to_string_lossy()
+                    .as_ref(),
+                &text,
+                &target,
+                100,
+            );
+
+            process::exit(0);
+        }
+
         let items = bundle::parse_fence(&text, &cfg.fence);
 
         if items.is_empty() {
@@ -956,7 +1021,8 @@ fn main() {
             process::exit(0);
         }
 
-        // Bundle diff. Same unsafe-path guard as --llm's write path: a
+        // Case 2: bundle diff, target is absent or a directory. Same
+        // unsafe-path guard as --llm's write path: a
         // clipboard-controlled filename must not be allowed to escape the
         // base dir via ../ traversal or a drive-letter/UNC prefix, since
         // resolving it here reads an arbitrary file off disk just as
