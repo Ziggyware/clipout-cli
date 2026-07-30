@@ -9,7 +9,6 @@
 //! Shim paths   : clipboard-IMAGE extraction (raw save / base64 / data-uri) via a single
 //!                STA PowerShell one-liner — mirrors clipin's raw-image shim, because
 //!                CF_DIB -> encodable-bitmap reconstruction in pure winapi is ~200 LOC.
-//! test
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::{self, Command};
@@ -146,98 +145,96 @@ mod bundle {
         pub content: String,
     }
 
-   pub fn parse_fence(text: &str, fence: &str) -> Vec<Rec> {
-    let lines: Vec<&str> = text
-        .split('\n')
-        .map(|l| l.strip_suffix('\r').unwrap_or(l))
-        .collect();
+    pub fn parse_fence(text: &str, fence: &str) -> Vec<Rec> {
+        let lines: Vec<&str> = text
+            .split('\n')
+            .map(|l| l.strip_suffix('\r').unwrap_or(l))
+            .collect();
 
-    let fence_char = fence.chars().next().unwrap_or('`');
+        let fence_char = fence.chars().next().unwrap_or('`');
 
-    let mut items = Vec::new();
-    let mut in_block = false;
-    let mut start = 0usize;
-    let mut name = String::new();
-    let mut open_len = 0usize;
-    let mut i = 0usize;
+        let mut items = Vec::new();
+        let mut in_block = false;
+        let mut start = 0usize;
+        let mut name = String::new();
+        let mut open_len = 0usize;
+        let mut i = 0usize;
 
-    while i < lines.len() {
-        let trimmed = lines[i].trim();
+        while i < lines.len() {
+            let trimmed = lines[i].trim();
 
-        
-        // ENTER BLOCK
-        if !in_block && trimmed.starts_with(fence) {
-            in_block = true;
-            open_len = trimmed.chars().take_while(|&c| c == fence_char).count();
+            // ENTER BLOCK
+            if !in_block && trimmed.starts_with(fence) {
+                in_block = true;
+                open_len = trimmed.chars().take_while(|&c| c == fence_char).count();
 
-            // Filename is the single line immediately preceding the fence.
-            let raw = if i > 0 { lines[i - 1].trim().to_string() } else { String::new() };
+                // Filename is the single line immediately preceding the fence.
+                let raw = if i > 0 { lines[i - 1].trim().to_string() } else { String::new() };
 
-            let mut n = raw;
-            while n.starts_with('#') {
-                n = n.trim_start_matches('#').trim().to_string();
-            }
-            while n.starts_with('/') {
-                n = n.trim_start_matches('/').trim().to_string();
-            }
-            n = n.replace('`', "").trim_end_matches(':').trim().to_string();
+                let mut n = raw;
+                while n.starts_with('#') {
+                    n = n.trim_start_matches('#').trim().to_string();
+                }
+                while n.starts_with('/') {
+                    n = n.trim_start_matches('/').trim().to_string();
+                }
+                n = n.replace('`', "").trim_end_matches(':').trim().to_string();
 
-            // If no usable filename before the fence, peek at the first line inside the block.
-            if !n.contains('.') && !n.contains(' ') && !n.contains(':') {
-                if i + 1 < lines.len() {
-                    let mut can = lines[i + 1].trim().to_string();
-                    can = can.replace('`', "").trim_end_matches(':').trim().to_string();
-                    while can.starts_with('/') {
-                        can = can.trim_start_matches('/').trim().to_string();
-                    }
-                    if can.contains('.') && !can.contains(' ') && !can.contains(':'){
-                        n = can;
-                        start = i + 2; // skip the filename line itself
+                // If no usable filename before the fence, peek at the first line inside the block.
+                if !n.contains('.') && !n.contains(' ') && !n.contains(':') {
+                    if i + 1 < lines.len() {
+                        let mut can = lines[i + 1].trim().to_string();
+                        can = can.replace('`', "").trim_end_matches(':').trim().to_string();
+                        while can.starts_with('/') {
+                            can = can.trim_start_matches('/').trim().to_string();
+                        }
+                        if can.contains('.') && !can.contains(' ') && !can.contains(':') {
+                            n = can;
+                            start = i + 2; // skip the filename line itself
+                        } else {
+                            n = format!("file_{}.txt", items.len());
+                            start = i + 1;
+                        }
                     } else {
                         n = format!("file_{}.txt", items.len());
                         start = i + 1;
                     }
                 } else {
-                    n = format!("file_{}.txt", items.len());
                     start = i + 1;
                 }
-            } else {
-                start = i + 1;
+
+                name = n;
+                i += 1;
+                continue;
             }
 
-            name = n;
+            // ------------------------------------------------------------
+            // EXIT BLOCK — a pure run of the fence char, length >= the
+            // opening run. A shorter run (e.g. a ``` example nested inside
+            // a ```` wrapper) is content, not a close.
+            // ------------------------------------------------------------
+            if in_block {
+                let run = trimmed.chars().take_while(|&c| c == fence_char).count();
+                let is_pure_close = run > 0 && run == trimmed.chars().count() && run >= open_len;
+                if is_pure_close {
+                    let content = lines[start..i].join("\r\n");
+                    items.push(Rec {
+                        name: name.clone(),
+                        content,
+                    });
+                    in_block = false;
+                }
+            }
+
             i += 1;
-            continue;
         }
 
-        // ------------------------------------------------------------
-        // EXIT BLOCK — a pure run of the fence char, length >= the
-        // opening run. A shorter run (e.g. a ``` example nested inside
-        // a ```` wrapper) is content, not a close.
-        // ------------------------------------------------------------
         if in_block {
-            let run = trimmed.chars().take_while(|&c| c == fence_char).count();
-            let is_pure_close = run > 0 && run == trimmed.chars().count() && run >= open_len;
-            if is_pure_close {
-                let content = lines[start..i].join("\r\n");
-                items.push(Rec {
-                    name: name.clone(),
-                    content,
-                });
-                in_block = false;
-            }
+            eprintln!("Warning: bundle ended inside a fenced block; content may be truncated.");
         }
 
-        i += 1;
+        items
     }
-
-    if in_block {
-        eprintln!("Warning: bundle ended inside a fenced block; content may be truncated.");
-    }
-
-    items
-}
-
 }
 
 #[derive(Default)]
@@ -269,8 +266,7 @@ fn parse() -> Cfg {
                 if let Some(target) = args.peek() {
                     c.diff_target = Some(target.clone());
                     args.next();
-                }
-                else {
+                } else {
                     eprintln!("Error: /diff requires a target file argument.");
                     process::exit(1);
                 }
@@ -559,10 +555,6 @@ struct Hunk {
 fn build_hunks(edits: &[Edit], context: usize) -> Vec<Hunk> {
     let n = edits.len();
 
-    // a_pos[i]/b_pos[i] = 0-indexed file position immediately BEFORE edits[i]
-    // runs. Needed because an inserted-only or deleted-only hunk has no
-    // Equal/Delete (resp. Insert) line inside it to read a start position
-    // from — the position must come from the running cursor, not the body.
     let mut a_pos = vec![0usize; n + 1];
     let mut b_pos = vec![0usize; n + 1];
     for (i, e) in edits.iter().enumerate() {
@@ -647,14 +639,6 @@ fn build_hunks(edits: &[Edit], context: usize) -> Vec<Hunk> {
     hunks
 }
 
-// =======================================================================
-// COLORIZED RENDERING — replaces the old plain unified_diff.
-//
-// Verified by compiled execution (rustc 1.75) against 4 cases: token-swap
-// modify, pure-append, pure-shrink, unpaired insert-only lines. See F
-// below for the one confirmed (not hypothesized) limitation.
-// =======================================================================
-
 mod pal {
     pub const HEADER_FILE: &str = "\x1b[1;38;2;220;220;235m";
     pub const HEADER_HUNK_FG: &str = "\x1b[38;2;180;220;255m";
@@ -689,10 +673,6 @@ fn common_suffix_len(a: &[char], b: &[char], prefix: usize) -> usize {
         .count()
 }
 
-/// Char-level prefix/suffix trim to find the changed span within a paired
-/// -/+ line. old_covered/new_covered are checked independently so a pure
-/// append or pure shrink still emphasizes the side that actually changed
-/// even when the other side is fully covered by prefix+suffix.
 fn render_intraline(old: &str, new: &str) -> (String, String) {
     let oc: Vec<char> = old.chars().collect();
     let nc: Vec<char> = new.chars().collect();
@@ -781,16 +761,6 @@ fn colorize_diff(name: &str, a: &[&str], b: &[&str], disk_content: &str, clip: &
             HUNK_BG, HEADER_HUNK_FG, HEADER_HUNK_RANGE, range_str, HEADER_HUNK_FG, RESET, RESET
         );
 
-        // Positional -/+ pairing within each contiguous change-run in the
-        // hunk body, used only to decide which lines get intraline
-        // emphasis. F: this is a heuristic, not real alignment — when a
-        // change-run mixes a genuine modify with an unrelated pure
-        // insert/delete, positional order can pair the wrong lines
-        // together (confirmed via harness case1: a `return x;` -> `return
-        // x + y;` modify sitting next to an unrelated `let y = 2;`
-        // insertion got cross-paired). Cosmetic only: doesn't affect
-        // which lines are marked -/+, only which spans get bold emphasis
-        // within an already-correct line.
         let mut pair_of: Vec<Option<usize>> = vec![None; hunk.body.len()];
         {
             let mut idx = 0;
@@ -883,159 +853,7 @@ fn unified_diff(name: &str, clip: &str, disk: &Path, max_changes: usize) {
     let edits = diff_lines(&a, &b);
     let hunks = build_hunks(&edits, 3);
 
-    println!("disk lines : {}", a.len());
-    println!("clip lines : {}", b.len());
-
-    println!("edits      : {}", edits.len());
-
-    println!(
-        "changes    : {}",
-        edits.iter().filter(|e| is_change(e)).count()
-    );
-
-    println!("hunks      : {}", hunks.len());
-
     colorize_diff(name, &a, &b, &disk_content, clip, &hunks, max_changes);
-}
-
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn reconstruct(a: &[&str], b: &[&str], edits: &[Edit]) -> (Vec<String>, Vec<String>) {
-        let mut ra = Vec::new();
-        let mut rb = Vec::new();
-        for e in edits {
-            match *e {
-                Edit::Equal(ai, bi) => {
-                    ra.push(a[ai].to_string());
-                    rb.push(b[bi].to_string());
-                }
-                Edit::Delete(ai) => ra.push(a[ai].to_string()),
-                Edit::Insert(bi) => rb.push(b[bi].to_string()),
-            }
-        }
-        (ra, rb)
-    }
-
-    fn check_roundtrip(a_text: &str, b_text: &str) {
-        let a: Vec<&str> = a_text.lines().collect();
-        let b: Vec<&str> = b_text.lines().collect();
-        let edits = diff_lines(&a, &b);
-        let (ra, rb) = reconstruct(&a, &b, &edits);
-        assert_eq!(ra, a, "reconstructed 'a' mismatch");
-        assert_eq!(rb, b, "reconstructed 'b' mismatch");
-    }
-
-    #[test]
-    fn roundtrip_basic_cases() {
-        check_roundtrip("a\nb\nc\n", "a\nx\nc\n");
-        check_roundtrip("", "a\nb\n");
-        check_roundtrip("a\nb\n", "");
-        check_roundtrip("same\nsame\nsame\n", "same\nsame\nsame\n");
-        check_roundtrip(
-            "one\ntwo\nthree\nfour\nfive\n",
-            "one\nTWO\nthree\nfour\nFIVE\nsix\n",
-        );
-    }
-
-    #[test]
-    fn roundtrip_randomized() {
-        let mut seed: u64 = 88172645463325252;
-        let mut next = || {
-            seed ^= seed << 13;
-            seed ^= seed >> 7;
-            seed ^= seed << 17;
-            seed
-        };
-        for _ in 0..200 {
-            let na = (next() % 12) as usize;
-            let a_lines: Vec<String> = (0..na).map(|_| format!("l{}", next() % 6)).collect();
-            let mut b_lines = a_lines.clone();
-            let mutations = (next() % 5) as usize;
-            for _ in 0..mutations {
-                let op = next() % 3;
-                let pos = if b_lines.is_empty() {
-                    0
-                } else {
-                    (next() as usize) % (b_lines.len() + 1)
-                };
-                match op {
-                    0 if !b_lines.is_empty() && pos < b_lines.len() => {
-                        b_lines.remove(pos);
-                    }
-                    1 => b_lines.insert(pos.min(b_lines.len()), format!("n{}", next() % 6)),
-                    _ if !b_lines.is_empty() => {
-                        let p = (next() as usize) % b_lines.len();
-                        b_lines[p] = format!("m{}", next() % 6);
-                    }
-                    _ => {}
-                }
-            }
-            let a_text = a_lines.join("\n") + if a_lines.is_empty() { "" } else { "\n" };
-            let b_text = b_lines.join("\n") + if b_lines.is_empty() { "" } else { "\n" };
-            check_roundtrip(&a_text, &b_text);
-        }
-    }
-}
-
-#[cfg(test)]
-mod debug_test {
-    use super::*;
-    #[test]
-    fn debug_case7() {
-        let a_text = std::fs::read_to_string("/tmp/a7.txt").unwrap();
-        let b_text = std::fs::read_to_string("/tmp/b7.txt").unwrap();
-        let a: Vec<&str> = a_text.lines().collect();
-        let b: Vec<&str> = b_text.lines().collect();
-        let trace = myers_trace(&a, &b);
-        let d = trace.len() - 1;
-        let edits = backtrack(&a, &b, &trace);
-        let changes = edits.iter().filter(|e| is_change(e)).count();
-        println!("D from trace = {}, edits changes = {}", d, changes);
-        assert_eq!(d, changes, "edit script length should equal D");
-    }
-}
-
-#[cfg(test)]
-mod debug_test2 {
-    use super::*;
-    #[test]
-    fn debug_minimal_repro() {
-        let a = vec!["line_5","line_6","line_1","line_0","line_1","line_4","line_3"];
-        let b = vec!["line_5","line_6","new_1","line_1","chg_5","line_1","line_4","line_3"];
-        let trace = myers_trace(&a, &b);
-        println!("D = {}", trace.len() - 1);
-        let edits = backtrack(&a, &b, &trace);
-        for e in &edits { println!("{:?}", e); }
-    }
-}
-
-#[cfg(test)]
-mod debug_test3 {
-    use super::*;
-    #[test]
-    fn debug_trace_dump() {
-        let a = vec!["line_5","line_6","line_1","line_0","line_1","line_4","line_3"];
-        let b = vec!["line_5","line_6","new_1","line_1","chg_5","line_1","line_4","line_3"];
-        let n = a.len() as isize;
-        let m = b.len() as isize;
-        let max_d = n + m;
-        let offset = max_d.max(1) as usize;
-        let trace = myers_trace(&a, &b);
-        for (d, v) in trace.iter().enumerate() {
-            let d = d as isize;
-            print!("d={}: ", d);
-            let mut k = -d;
-            while k <= d {
-                let idx = (offset as isize + k) as usize;
-                print!("k={} x={} | ", k, v[idx]);
-                k += 2;
-            }
-            println!();
-        }
-    }
 }
 
 const HELP: &str = "\x1b[1;36mclipout\x1b[0m — paste clipboard contents to disk
@@ -1053,6 +871,10 @@ const HELP: &str = "\x1b[1;36mclipout\x1b[0m — paste clipboard contents to dis
     \x1b[0;33m--llm\x1b[0m             Extract an LLM fenced-block bundle to disk
     \x1b[0;33m--fmt:<ext>\x1b[0m       Output image format (png | jpg | bmp | gif | tif)
     \x1b[0;33m--fence:<chars>\x1b[0m   Fence marker for --llm (default: ```)
+    \x1b[0;33m/diff [target]\x1b[0m    Diff clipboard against disk. Plain-text clipboard
+                          requires [target]; a fenced bundle diffs each
+                          file against its same-named counterpart under
+                          [target] (or its parent dir), default cwd.
 
   \x1b[0;34mMODES\x1b[0m (auto-selected)
     \x1b[2;37mclipout shot.png\x1b[0m
@@ -1060,6 +882,8 @@ const HELP: &str = "\x1b[1;36mclipout\x1b[0m — paste clipboard contents to dis
     \x1b[2;37mclipout --llm\x1b[0m
     \x1b[2;37mclipout ./dest/\x1b[0m
     \x1b[2;37mclipout notes.txt\x1b[0m
+    \x1b[2;37mclipout /diff src/main.rs\x1b[0m
+    \x1b[2;37mclipout /diff ./src/\x1b[0m
     \x1b[2;37mclipout\x1b[0m
 ";
 
@@ -1081,19 +905,31 @@ fn main() {
         eprintln!(
             "  {}[PARSE]{} {}llm{}={}{}{} {}b64{}={}{}{} {}data{}={}{}{} {}forceImage{}={}{}{} {}fmt{}={}{:?}{} {}fence{}={}{:?}{} {}pos{}={}{:?}{}",
             COLOR_TRACE, COLOR_RESET,
-            COLOR_INFO, COLOR_RESET, COLOR_TRACE, cfg.from_llm, COLOR_RESET, 
-            COLOR_INFO, COLOR_RESET, COLOR_TRACE, cfg.as_b64, COLOR_RESET, 
-            COLOR_INFO, COLOR_RESET, COLOR_TRACE, cfg.as_data, COLOR_RESET, 
-            COLOR_INFO, COLOR_RESET, COLOR_TRACE, cfg.force_image, COLOR_RESET, 
-            COLOR_INFO, COLOR_RESET, COLOR_TRACE, cfg.fmt, COLOR_RESET, 
-            COLOR_INFO, COLOR_RESET, COLOR_TRACE, cfg.fence, COLOR_RESET, 
-            COLOR_INFO, COLOR_RESET, COLOR_TRACE, cfg.positional, COLOR_RESET, 
+            COLOR_INFO, COLOR_RESET, COLOR_TRACE, cfg.from_llm, COLOR_RESET,
+            COLOR_INFO, COLOR_RESET, COLOR_TRACE, cfg.as_b64, COLOR_RESET,
+            COLOR_INFO, COLOR_RESET, COLOR_TRACE, cfg.as_data, COLOR_RESET,
+            COLOR_INFO, COLOR_RESET, COLOR_TRACE, cfg.force_image, COLOR_RESET,
+            COLOR_INFO, COLOR_RESET, COLOR_TRACE, cfg.fmt, COLOR_RESET,
+            COLOR_INFO, COLOR_RESET, COLOR_TRACE, cfg.fence, COLOR_RESET,
+            COLOR_INFO, COLOR_RESET, COLOR_TRACE, cfg.positional, COLOR_RESET,
         );
     }
 
+    // ===================================================================
     // Diff mode
+    //
+    // Plain-text clipboard: diff clipboard text directly against
+    // cfg.diff_target (required).
+    //
+    // Fenced bundle on clipboard: diff EACH bundled file against its
+    // same-named counterpart on disk. Base dir resolves the same way
+    // --llm resolves its write target: cfg.diff_target if given (as a
+    // directory, or as a file whose parent is used), else cwd. This was
+    // previously a silent no-op — a bundle on the clipboard produced zero
+    // output and exit 0, which is worse than an error because it looks
+    // like "no changes" rather than "didn't run".
+    // ===================================================================
     if cfg.diff {
-        
         let text = clipboard::get_text().unwrap_or_default();
         let items = bundle::parse_fence(&text, &cfg.fence);
 
@@ -1107,7 +943,8 @@ fn main() {
             };
 
             unified_diff(
-                target.file_name()
+                target
+                    .file_name()
                     .unwrap_or_default()
                     .to_string_lossy()
                     .as_ref(),
@@ -1118,7 +955,66 @@ fn main() {
 
             process::exit(0);
         }
-        
+
+        // Bundle diff. Same unsafe-path guard as --llm's write path: a
+        // clipboard-controlled filename must not be allowed to escape the
+        // base dir via ../ traversal or a drive-letter/UNC prefix, since
+        // resolving it here reads an arbitrary file off disk just as
+        // writing one there would write an arbitrary file.
+        let base_dir: PathBuf = match &cfg.diff_target {
+            Some(p) => {
+                let pb = if Path::new(p).is_absolute() {
+                    PathBuf::from(p)
+                } else {
+                    cwd().join(p)
+                };
+                if pb.is_dir() {
+                    pb
+                } else {
+                    match pb.parent() {
+                        Some(par) if !par.as_os_str().is_empty() => par.to_path_buf(),
+                        _ => cwd(),
+                    }
+                }
+            }
+            None => cwd(),
+        };
+
+        let mut diffed = 0usize;
+        let mut skipped = 0usize;
+
+        for (idx, it) in items.iter().enumerate() {
+            let name = it.name.replace('\\', "/");
+
+            if name.starts_with("../") || name.contains("/../") || name.contains(':') {
+                eprintln!(
+                    "{}Skipping unsafe path{}: {}{}{}",
+                    COLOR_WARNING, COLOR_RESET, COLOR_INFO, name, COLOR_RESET
+                );
+                skipped += 1;
+                continue;
+            }
+
+            let disk_path = if Path::new(&name).is_absolute() {
+                PathBuf::from(&name)
+            } else {
+                base_dir.join(&name)
+            };
+
+            if idx > 0 {
+                println!();
+            }
+
+            unified_diff(&name, &it.content, &disk_path, 100);
+            diffed += 1;
+        }
+
+        eprintln!(
+            "\n{}{} file(s) diffed{}, {}{} skipped{}.",
+            COLOR_DESC, diffed, COLOR_RESET, COLOR_WARNING, skipped, COLOR_RESET
+        );
+
+        process::exit(if diffed > 0 { 0 } else { 1 });
     }
 
     {
@@ -1159,10 +1055,10 @@ fn main() {
                     let name = it.name.replace('\\', "/");
 
                     if name.starts_with("../") || name.contains("/../") || name.contains(":") {
-                        eprintln!("{}Skipping unsafe path{}: {}{}{}", 
-                            COLOR_WARNING,
-                            COLOR_RESET,
-                            COLOR_INFO, name, COLOR_RESET);
+                        eprintln!(
+                            "{}Skipping unsafe path{}: {}{}{}",
+                            COLOR_WARNING, COLOR_RESET, COLOR_INFO, name, COLOR_RESET
+                        );
                         continue;
                     }
 
@@ -1179,19 +1075,17 @@ fn main() {
                             println!("{}", out.display());
                             written.push(out);
                         }
-                        Err(e) => eprintln!("{}Failed {}{}{}: {}{}{}", 
-                            COLOR_ERROR, 
-                            COLOR_INFO, out.display(), COLOR_RESET,
-                            COLOR_INFO, e, COLOR_RESET),
+                        Err(e) => eprintln!(
+                            "{}Failed {}{}{}: {}{}{}",
+                            COLOR_ERROR, COLOR_INFO, out.display(), COLOR_RESET, COLOR_INFO, e, COLOR_RESET
+                        ),
                     }
                 }
 
-                println!("{}{} file(s) written{} {}LLM bundle{}.",
-                    COLOR_DESC,
-                    items.len(),
-                    COLOR_RESET,
-                    COLOR_INFO,
-                    COLOR_RESET);
+                println!(
+                    "{}{} file(s) written{} {}LLM bundle{}.",
+                    COLOR_DESC, items.len(), COLOR_RESET, COLOR_INFO, COLOR_RESET
+                );
                 trace_summary(cfg.trace, &written);
                 process::exit(0);
             }
@@ -1372,4 +1266,85 @@ fn main() {
     }
 
     process::exit(1);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn reconstruct(a: &[&str], b: &[&str], edits: &[Edit]) -> (Vec<String>, Vec<String>) {
+        let mut ra = Vec::new();
+        let mut rb = Vec::new();
+        for e in edits {
+            match *e {
+                Edit::Equal(ai, bi) => {
+                    ra.push(a[ai].to_string());
+                    rb.push(b[bi].to_string());
+                }
+                Edit::Delete(ai) => ra.push(a[ai].to_string()),
+                Edit::Insert(bi) => rb.push(b[bi].to_string()),
+            }
+        }
+        (ra, rb)
+    }
+
+    fn check_roundtrip(a_text: &str, b_text: &str) {
+        let a: Vec<&str> = a_text.lines().collect();
+        let b: Vec<&str> = b_text.lines().collect();
+        let edits = diff_lines(&a, &b);
+        let (ra, rb) = reconstruct(&a, &b, &edits);
+        assert_eq!(ra, a, "reconstructed 'a' mismatch");
+        assert_eq!(rb, b, "reconstructed 'b' mismatch");
+    }
+
+    #[test]
+    fn roundtrip_basic_cases() {
+        check_roundtrip("a\nb\nc\n", "a\nx\nc\n");
+        check_roundtrip("", "a\nb\n");
+        check_roundtrip("a\nb\n", "");
+        check_roundtrip("same\nsame\nsame\n", "same\nsame\nsame\n");
+        check_roundtrip(
+            "one\ntwo\nthree\nfour\nfive\n",
+            "one\nTWO\nthree\nfour\nFIVE\nsix\n",
+        );
+    }
+
+    #[test]
+    fn roundtrip_randomized() {
+        let mut seed: u64 = 88172645463325252;
+        let mut next = || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed
+        };
+        for _ in 0..200 {
+            let na = (next() % 12) as usize;
+            let a_lines: Vec<String> = (0..na).map(|_| format!("l{}", next() % 6)).collect();
+            let mut b_lines = a_lines.clone();
+            let mutations = (next() % 5) as usize;
+            for _ in 0..mutations {
+                let op = next() % 3;
+                let pos = if b_lines.is_empty() {
+                    0
+                } else {
+                    (next() as usize) % (b_lines.len() + 1)
+                };
+                match op {
+                    0 if !b_lines.is_empty() && pos < b_lines.len() => {
+                        b_lines.remove(pos);
+                    }
+                    1 => b_lines.insert(pos.min(b_lines.len()), format!("n{}", next() % 6)),
+                    _ if !b_lines.is_empty() => {
+                        let p = (next() as usize) % b_lines.len();
+                        b_lines[p] = format!("m{}", next() % 6);
+                    }
+                    _ => {}
+                }
+            }
+            let a_text = a_lines.join("\n") + if a_lines.is_empty() { "" } else { "\n" };
+            let b_text = b_lines.join("\n") + if b_lines.is_empty() { "" } else { "\n" };
+            check_roundtrip(&a_text, &b_text);
+        }
+    }
 }
