@@ -145,6 +145,67 @@ mod bundle {
         pub content: String,
     }
 
+pub fn find_filename_before_block(
+    lines: &[&str],
+    fence_index: usize
+    ) -> Option<String> {
+        let mut k = fence_index;
+
+        while k > 0 {
+            k -= 1;
+            let raw = lines[k].trim();
+
+            if raw.is_empty() {
+                continue;
+            }
+
+            let cleaned = raw.trim()
+                .trim_start_matches('#')
+                .trim()
+                .trim_start_matches('.')
+                .trim()
+                .trim_start_matches('\\')
+                .trim()
+                .trim_start_matches('.')
+                .trim()
+                .trim_start_matches('\\')
+                .trim()
+                .trim_start_matches('.')
+                .trim()
+                .trim_start_matches('\\')
+                .trim()
+                .trim_matches('*')
+                .trim()
+                .trim_matches('.')
+                .trim()
+                .trim_matches('(')
+                .trim()
+                .trim_matches(')')
+                .trim()
+                .trim_matches('-')
+                .trim()
+                .trim_matches('+')
+                .trim()
+                .trim_matches('~')
+                .trim()
+                .trim_matches('[')
+                .trim()
+                .trim_matches(']')
+                .trim()
+                .trim_matches('`')
+                .trim();
+
+            if cleaned.contains('.') {
+                return Some(cleaned.to_string());
+            }
+
+            if cleaned.contains('/') || cleaned.contains('\\') {
+                return Some(cleaned.to_string());
+            }
+        }
+
+        None
+    }
     pub fn parse_fence(text: &str, fence: &str) -> Vec<Rec> {
         let lines: Vec<&str> = text
             .split('\n')
@@ -163,15 +224,31 @@ mod bundle {
         while i < lines.len() {
             let trimmed = lines[i].trim();
 
+
             // ENTER BLOCK
             if !in_block && trimmed.starts_with(fence) {
                 in_block = true;
                 open_len = trimmed.chars().take_while(|&c| c == fence_char).count();
 
-                // Filename is the single line immediately preceding the fence.
-                let raw = if i > 0 { lines[i - 1].trim().to_string() } else { String::new() };
+                let filename = find_filename_before_block(&lines, i);
+                //println!("{}", filename.as_deref().unwrap_or("<no filename>"));
+                if let Some(file_str) = filename {
+                    let mut end_index = file_str.len();
+                    
+                    if let Some(idx) = file_str.find(' ') {
+                        end_index = end_index.min(idx);
+                    }
+                    if let Some(idx) = file_str.find('(') {
+                        end_index = end_index.min(idx);
+                    }
+                    if let Some(idx) = file_str.find("//") {
+                        end_index = end_index.min(idx);
+                    }
+                    
+                    name = file_str[..end_index].to_string();
+                }
 
-                let mut n = raw;
+                let mut n = name;
                 while n.starts_with('#') {
                     n = n.trim_start_matches('#').trim().to_string();
                 }
@@ -278,8 +355,8 @@ fn parse() -> Cfg {
                     c.diff_target = Some(target.clone());
                     i += 1;
                 } else {
-                    eprintln!("Error: /diff requires a target file argument.");
-                    process::exit(1);
+                   // eprintln!("Error: /diff requires a target file argument.");
+                  //  process::exit(1);
                 }
             }
             "/image" | "/i" | "--i" | "-i" | "--image" => c.force_image = true,
