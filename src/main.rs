@@ -327,6 +327,12 @@ struct Cfg {
     positional: Option<String>,
     diff: bool,
     diff_target: Option<String>,
+    view: bool,
+merge: bool,
+merge_ours: bool,
+merge_theirs: bool,
+merge_both: bool,
+
 }
 
 fn parse() -> Cfg {
@@ -366,6 +372,13 @@ fn parse() -> Cfg {
             "/llm" | "/l" | "--llm" | "--l" | "-llm" | "-l" => c.from_llm = true,
             "/trace" | "/t" | "--t" | "--trace" | "-t" => c.trace = true,
             "/help" | "/h" | "/?" | "--h" | "--help" | "-h" | "-?" | "?" => c.help = true,
+            "/view" | "/v" | "-view" | "--view" | "-v" | "--v" => c.view  = true,
+            "/merge" | "--merge" => c.merge = true,
+"/merge:ours" | "--merge:ours" => { c.merge = true; c.merge_ours = true; }
+"/merge:theirs" | "--merge:theirs" => { c.merge = true; c.merge_theirs = true; }
+"/merge:both" | "--merge:both" => { c.merge = true; c.merge_both = true; }
+
+
             s if s.starts_with("--fmt:") => c.fmt = Some(s[6..].to_lowercase()),
             s if s.starts_with("--fence:") => c.fence = s[8..].to_string(),
             s if s.starts_with("--") => {}
@@ -933,7 +946,7 @@ fn colorize_diff(name: &str, a: &[&str], b: &[&str], disk_content: &str, clip: &
     }
 }
 
-fn unified_diff(name: &str, clip: &str, disk: &Path, max_changes: usize) {
+fn unified_diff(cfg: &Cfg, name: &str, clip: &str, disk: &Path, max_changes: usize) {
     let disk_content = fs::read_to_string(disk).unwrap_or_default();
 
     let a: Vec<&str> = disk_content.lines().collect();
@@ -941,6 +954,118 @@ fn unified_diff(name: &str, clip: &str, disk: &Path, max_changes: usize) {
 
     let edits = diff_lines(&a, &b);
     let hunks = build_hunks(&edits, 3);
+if cfg.merge {
+    let mut merged: Vec<String> = Vec::new();
+
+    for hunk in &hunks {
+        let mut conflict = false;
+        let mut ours: Vec<String> = Vec::new();
+        let mut theirs: Vec<String> = Vec::new();
+
+        for (marker, idx) in &hunk.body {
+            match *marker {
+                ' ' => {
+                    merged.push(a[*idx].to_string());
+                }
+                '-' => {
+                    conflict = true;
+                    ours.push(a[*idx].to_string());
+                }
+                '+' => {
+                    conflict = true;
+                    theirs.push(b[*idx].to_string());
+                }
+                _ => {}
+            }
+        }
+
+      /*  if conflict {
+            if cfg.merge_ours {
+                merged.extend(ours.into_iter());
+            } else if cfg.merge_theirs {
+                merged.extend(theirs.into_iter());
+            } else if cfg.merge_both {
+                merged.extend(ours.into_iter());
+                merged.extend(theirs.into_iter());
+            } else {
+                // Default: produce conflict markers
+                merged.push("<<<<<<< OURS".into());
+                merged.extend(ours.into_iter());
+                merged.push("=======".into());
+                merged.extend(theirs.into_iter());
+                merged.push(">>>>>>> THEIRS".into());
+            }
+        }
+*/
+
+if conflict {
+    if cfg.merge_ours {
+        merged.extend(ours.into_iter());
+    } else if cfg.merge_theirs {
+        merged.extend(theirs.into_iter());
+    } else if cfg.merge_both {
+        merged.extend(ours.into_iter());
+        merged.extend(theirs.into_iter());
+    } else {
+        // ---------- COLORIZED CONFLICT BLOCK ----------
+        use pal::*;
+
+        merged.push(format!("{}<<<<<<< OURS{}", DEL_BG, RESET));
+
+       // for line in &ours {
+         //   merged.push(format!("{}- {}{}", DEL_BG, line, RESET));
+       // }
+
+for (i, line) in ours.iter().enumerate() {
+    if let Some(their_line) = theirs.get(i) {
+        let (old_out, _) = render_intraline(line, their_line);
+        merged.push(format!("{}- {}{}", DEL_BG, old_out, RESET));
+    } else {
+        merged.push(format!("{}- {}{}", DEL_BG, line, RESET));
+    }
+}
+
+
+        merged.push(format!("{}======={}", CTX_FG, RESET));
+
+      //  for line in &theirs {
+       //     merged.push(format!("{}+ {}{}", INS_BG, line, RESET));
+        //}
+
+for (i, line) in theirs.iter().enumerate() {
+    if let Some(our_line) = ours.get(i) {
+        let (_, new_out) = render_intraline(our_line, line);
+        merged.push(format!("{}+ {}{}", INS_BG, new_out, RESET));
+    } else {
+        merged.push(format!("{}+ {}{}", INS_BG, line, RESET));
+    }
+}
+
+
+        merged.push(format!("{}>>>>>>> THEIRS{}", INS_BG, RESET));
+        // ----------------------------------------------
+    }
+}
+
+
+    }
+
+    let merged_text = merged.join("\n");
+
+    if let Some(target) = &cfg.positional {
+        let path = Path::new(target);
+        ensure_parent(path);
+        if let Err(e) = fs::write(path, merged_text.as_bytes()) {
+            eprintln!("Error writing merged output: {}", e);
+            process::exit(1);
+        }
+        println!("Merged output written to {}", target);
+    } else {
+        println!("{}", merged_text);
+    }
+
+    process::exit(0);
+}
 
     colorize_diff(name, &a, &b, &disk_content, clip, &hunks, max_changes);
 }
@@ -954,6 +1079,7 @@ const HELP: &str = "\x1b[1;36mclipout\x1b[0m — paste clipboard contents to dis
     \x1b[0;33m--h --help\x1b[0m        Show this message
     \x1b[0;33m--t --trace\x1b[0m       Verbose diagnostics + written-file summary
     \x1b[0;33m--i --image\x1b[0m       Treat clipboard as an image
+    \x1b[0;33m--view\x1b[0m            View full clipboard text
     \x1b[0;33m--b64\x1b[0m             Write clipboard image as a Base64 text file
     \x1b[0;33m--data\x1b[0m            Write clipboard image as an HTML Base64 data URI file
     \x1b[0;33m--files\x1b[0m           Force file-drop handling (normally auto-detected)
@@ -1059,7 +1185,7 @@ fn main() {
                 cwd().join(p)
             };
 
-            unified_diff(
+            unified_diff(&cfg,
                 target
                     .file_name()
                     .unwrap_or_default()
@@ -1084,7 +1210,7 @@ fn main() {
                 }
             };
 
-            unified_diff(
+            unified_diff(&cfg,
                 target
                     .file_name()
                     .unwrap_or_default()
@@ -1148,7 +1274,7 @@ fn main() {
                 println!();
             }
 
-            unified_diff(&name, &it.content, &disk_path, 100);
+            unified_diff(&cfg, &name, &it.content, &disk_path, 100);
             diffed += 1;
         }
 
@@ -1158,6 +1284,12 @@ fn main() {
         );
 
         process::exit(if diffed > 0 { 0 } else { 1 });
+    }
+
+    if cfg.view {
+        let text = clipboard::get_text().unwrap_or_default();
+        println!("{}", text);
+        process::exit(0);
     }
 
     {
