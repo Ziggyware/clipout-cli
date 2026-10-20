@@ -3,6 +3,38 @@ pub struct Rec {
     pub content: String,
 }
 
+/// Strips markdown/list decoration characters from the edges of a candidate line.
+fn marker_trim(s: &str) -> &str {
+    s.trim_matches(|c| {
+        matches!(c, '*' | '(' | ')' | '-' | '+' | '~' | '[' | ']' | '`' | ':')
+    })
+    .trim()
+}
+
+/// Strips a leading numbered-list prefix such as `1. ` or `2) ` from a line.
+/// Requires whitespace after the delimiter so that paths like `3.14/pi.txt`
+/// are left untouched.
+fn strip_number_prefix(s: &str) -> &str {
+    let mut out = s.trim_start();
+
+    loop {
+        let digits = out.len() - out.trim_start_matches(|c: char| c.is_ascii_digit()).len();
+        if digits == 0 {
+            break;
+        }
+        let rest = &out[digits..];
+        let after = rest.strip_prefix('.').or_else(|| rest.strip_prefix(')'));
+        match after {
+            Some(r) if r.starts_with(|c: char| c.is_whitespace()) => {
+                out = r.trim_start();
+            }
+            _ => break,
+        }
+    }
+
+    out
+}
+
 pub fn find_filename_before_block(lines: &[&str], fence_index: usize) -> Option<String> {
     let mut k = fence_index;
 
@@ -33,9 +65,8 @@ pub fn find_filename_before_block(lines: &[&str], fence_index: usize) -> Option<
             }
         }
 
-        cleaned = cleaned.trim_matches(|c| {
-            matches!(c, '*' | '(' | ')' | '-' | '+' | '~' | '[' | ']' | '`' | ':')
-        }).trim();
+        let cleaned = marker_trim(cleaned);
+        let cleaned = marker_trim(strip_number_prefix(cleaned));
 
         if cleaned.starts_with('.') || cleaned.contains('.') || cleaned.contains('/') || cleaned.contains('\\') {
             if let Some(space_idx) = cleaned.find(' ') {
@@ -80,6 +111,7 @@ pub fn parse_fence(text: &str, fence: &str) -> Vec<Rec> {
                 if i + 1 < lines.len() {
                     let mut can = lines[i + 1].trim().to_string();
                     can = can.replace('`', "").trim_end_matches(':').trim().to_string();
+                    can = strip_number_prefix(&can).trim().to_string();
                     
                     if (can.contains('.') || can.contains('/') || can.contains('\\') || can.starts_with('.')) && !can.contains(' ') {
                         n = can;
@@ -122,4 +154,83 @@ pub fn parse_fence(text: &str, fence: &str) -> Vec<Rec> {
     }
 
     items
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn strips_numbered_list_prefixes() {
+        assert_eq!(strip_number_prefix("1. path/filename"), "path/filename");
+        assert_eq!(strip_number_prefix("2) path/filename.rs"), "path/filename.rs");
+        assert_eq!(strip_number_prefix("12. src/main.rs"), "src/main.rs");
+        assert_eq!(strip_number_prefix("1. 2. nested/path.rs"), "nested/path.rs");
+    }
+
+    #[test]
+    fn keeps_paths_that_look_like_numbers() {
+        assert_eq!(strip_number_prefix("3.14/pi.txt"), "3.14/pi.txt");
+        assert_eq!(strip_number_prefix("2024/report.pdf"), "2024/report.pdf");
+        assert_eq!(strip_number_prefix("1.5 release notes.md"), "1.5 release notes.md");
+    }
+
+    fn parse(text: &str) -> Vec<Rec> {
+        parse_fence(text, "```")
+    }
+
+    #[test]
+    fn numbered_filename_line_before_fence() {
+        let text = "1. path/filename.rs\n```rust\nfn main() {}\n```\n";
+        let items = parse(text);
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].name, "path/filename.rs");
+        assert_eq!(items[0].content, "fn main() {}");
+    }
+
+    #[test]
+    fn numbered_filename_with_trailing_description() {
+        let text = "2) src/lib.rs - the library\n```\npub fn x() {}\n```\n";
+        let items = parse(text);
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].name, "src/lib.rs");
+    }
+
+    #[test]
+    fn multiple_numbered_files_in_bundle() {
+        let text = "1. src/a.rs\n```\nA\n```\n\n2. src/b.rs\n```\nB\n```\n";
+        let items = parse(text);
+        assert_eq!(items.len(), 2);
+        assert_eq!(items[0].name, "src/a.rs");
+        assert_eq!(items[0].content, "A");
+        assert_eq!(items[1].name, "src/b.rs");
+        assert_eq!(items[1].content, "B");
+    }
+
+    #[test]
+    fn numbered_bold_filename_and_file_label_still_work() {
+        let text = "**3. docs/readme.md**\n```\n# Hi\n```\n\nFile: 4. notes/todo.txt\n```\nstuff\n```\n";
+        let items = parse(text);
+        assert_eq!(items.len(), 2);
+        assert_eq!(items[0].name, "docs/readme.md");
+        assert_eq!(items[1].name, "notes/todo.txt");
+    }
+
+    #[test]
+    fn numbered_filename_inside_fence_fallback() {
+        let text = "```\n1. path/filename.rs\n```\n";
+        let items = parse(text);
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].name, "path/filename.rs");
+        assert_eq!(items[0].content, "");
+    }
+
+    #[test]
+    fn numbered_content_line_not_eaten_when_not_path_like() {
+        let text = "```\n1. step one\n2. step two\n```\n";
+        let items = parse(text);
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].name, "file_0.txt");
+        assert_eq!(items[0].content, "1. step one\r\n2. step two");
+    }
 }
