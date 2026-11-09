@@ -1,14 +1,5 @@
 //! clipout — Rust port of clipout.ps1 (behavior-contract fidelity).
 //! Sibling to clipin. Reads the Windows clipboard and writes it to disk.
-//!
-//! Placement:  src/bin/clipout.rs   (alongside src/main.rs = clipin)
-//! Build:      cargo build --release -> target/release/clipout.exe
-//! Cargo.toml: winapi features must include winuser, winbase, shellapi, windef, minwindef
-//!
-//! Native paths : text write / echo, LLM-bundle extract, file-drop copy + transcode.
-//! Shim paths   : clipboard-IMAGE extraction (raw save / base64 / data-uri) via a single
-//!                STA PowerShell one-liner — mirrors clipin's raw-image shim, because
-//!                CF_DIB -> encodable-bitmap reconstruction in pure winapi is ~200 LOC.
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -19,8 +10,6 @@ mod clipboard;
 mod imgutil;
 mod bundle;
 mod diff;
-
-use config::Cfg;
 
 fn add_commas(n: i64) -> String {
     let neg = n < 0;
@@ -42,8 +31,10 @@ fn preview_llm_items(items: &[bundle::Rec]) {
     const MAX_LINES: usize = 3;
     const MAX_CHARS: usize = 120;
 
-    const COLOR_FILE: &str = "\x1b[1;36m";
-    const COLOR_LINE: &str = "\x1b[1;33m";
+    const COLOR_NAMED_FILE: &str = "\x1b[1;36m";
+    const COLOR_UNNAMED_FILE: &str = "\x1b[1;33m";
+    const COLOR_TAG_UNNAMED: &str = "\x1b[2;33m";
+    const COLOR_LINE: &str = "\x1b[0;37m";
     const COLOR_RESET: &str = "\x1b[0m";
     const COLOR_LENGTH: &str = "\x1b[2;37m";
     const COLOR_LENGTH_DESC: &str = "\x1b[2;36m";
@@ -51,10 +42,32 @@ fn preview_llm_items(items: &[bundle::Rec]) {
     let stdout = io::stdout();
     let mut out = stdout.lock();
 
-    writeln!(out, "").unwrap();
+    writeln!(out).unwrap();
 
     for it in items {
-        writeln!(out, "{}{}{} {}{} {}bytes{} {}{} {}lines{}", COLOR_FILE, it.name, COLOR_RESET, COLOR_LENGTH, add_commas(it.content.len() as i64), COLOR_LENGTH_DESC, COLOR_RESET, COLOR_LENGTH, add_commas(it.content.lines().count() as i64), COLOR_LENGTH_DESC, COLOR_RESET).unwrap();
+        let (file_color, tag) = if it.unnamed {
+            (COLOR_UNNAMED_FILE, format!(" {}[unnamed]{}", COLOR_TAG_UNNAMED, COLOR_RESET))
+        } else {
+            (COLOR_NAMED_FILE, String::new())
+        };
+
+        writeln!(
+            out,
+            "{}{}{}{} {}{} {}bytes{} {}{} {}lines{}",
+            file_color,
+            it.name,
+            tag,
+            COLOR_RESET,
+            COLOR_LENGTH,
+            add_commas(it.content.len() as i64),
+            COLOR_LENGTH_DESC,
+            COLOR_RESET,
+            COLOR_LENGTH,
+            add_commas(it.content.lines().count() as i64),
+            COLOR_LENGTH_DESC,
+            COLOR_RESET
+        )
+        .unwrap();
 
         let lines: Vec<&str> = it
             .content
@@ -146,11 +159,7 @@ fn shim_clipboard_image(mode: ImgMode, dest: &str, ps_fmt: &str, mime: &str) -> 
 
 fn shim_transcode(src: &str, dest: &str, ps_fmt: &str) -> Result<(), String> {
     let cmd = format!(
-        "$ErrorActionPreference='Stop';\
-         Add-Type -AssemblyName System.Drawing;\
-         $i=[System.Drawing.Image]::FromFile('{}');\
-         $i.Save('{}',[System.Drawing.Imaging.ImageFormat]::{});\
-	 $i.Dispose()",
+        r#"$ErrorActionPreference='Stop';Add-Type -AssemblyName System.Drawing;$i=[System.Drawing.Image]::FromFile('{}');$i.Save('{}',[System.Drawing.Imaging.ImageFormat]::{});$i.Dispose()"#,
         ps_escape(src),
         ps_escape(dest),
         ps_fmt
@@ -178,63 +187,30 @@ fn trace_summary(on: bool, files: &[PathBuf]) {
 }
 
 const HELP: &str = "\x1b[1;36mclipout\x1b[0m — paste clipboard contents to disk
-
   \x1b[0;34mUSAGE\x1b[0m
     clipout [destination] [flags]
-
   \x1b[0;34mFLAGS\x1b[0m
-    \x1b[0;33m--h --help\x1b[0m        Show this message
-    \x1b[0;33m--t --trace\x1b[0m       Verbose diagnostics + written-file summary
-    \x1b[0;33m--i --image\x1b[0m       Treat clipboard as an image
-    \x1b[0;33m--view\x1b[0m            View full clipboard text
-    \x1b[0;33m--b64\x1b[0m             Write clipboard image as a Base64 text file
-    \x1b[0;33m--data\x1b[0m            Write clipboard image as an HTML Base64 data URI file
-    \x1b[0;33m--files\x1b[0m           Force file-drop handling (normally auto-detected)
-    \x1b[0;33m--llm\x1b[0m             Extract an LLM fenced-block bundle to disk
-    \x1b[0;33m--fmt:<ext>\x1b[0m       Output image format (png | jpg | bmp | gif | tif)
-    \x1b[0;33m--fence:<chars>\x1b[0m   Fence marker for --llm (default: ```)
-    \x1b[0;33m/diff [target]\x1b[0m    Diff clipboard against disk. Plain-text clipboard
-                          requires [target]; a fenced bundle diffs each
-                          file against its same-named counterpart under
-                          [target] (or its parent dir), default cwd.
-
-  \x1b[0;34mMODES\x1b[0m (auto-selected)
-    \x1b[2;37mclipout shot.png\x1b[0m
-    \x1b[2;37mclipout shot.jpg --fmt:jpg\x1b[0m
-    \x1b[2;37mclipout --llm\x1b[0m
-    \x1b[2;37mclipout ./dest/\x1b[0m
-    \x1b[2;37mclipout notes.txt\x1b[0m
-    \x1b[2;37mclipout /diff src/main.rs\x1b[0m
-    \x1b[2;37mclipout /diff ./src/\x1b[0m
-    \x1b[2;37mclipout\x1b[0m
+    \x1b[0;33m--h --help\x1b[0m         Show this message
+    \x1b[0;33m--t --trace\x1b[0m        Verbose diagnostics + written-file summary
+    \x1b[0;33m--i --image\x1b[0m        Treat clipboard as an image
+    \x1b[0;33m--view\x1b[0m             View full clipboard text
+    \x1b[0;33m--b64\x1b[0m              Write clipboard image as a Base64 text file
+    \x1b[0;33m--data\x1b[0m             Write clipboard image as an HTML Base64 data URI file
+    \x1b[0;33m--files\x1b[0m            Force file-drop handling (normally auto-detected)
+    \x1b[0;33m--llm\x1b[0m              Extract an LLM fenced-block bundle to disk
+    \x1b[0;33m--u --unnamed\x1b[0m      Force inclusion of unnamed file_?.txt fenced blocks
+    \x1b[0;33m--fmt:<ext>\x1b[0m        Output image format (png | jpg | bmp | gif | tif)
+    \x1b[0;33m--fence:<chars>\x1b[0m    Fence marker for --llm (default: ```)
+    \x1b[0;33m/diff [target]\x1b[0m     Diff clipboard against disk.
 ";
 
 fn main() {
-    const COLOR_ERROR: &str = "\x1b[1;31m";
-    const COLOR_WARNING: &str = "\x1b[0;33m";
-    const COLOR_RESET: &str = "\x1b[0m";
-    const COLOR_INFO: &str = "\x1b[0;34m";
-    const COLOR_TRACE: &str = "\x1b[2;3m";
     const COLOR_DESC: &str = "\x1b[2;36m";
     let cfg = config::parse();
 
     if cfg.help {
         print!("{}", HELP);
         return;
-    }
-
-    if cfg.trace {
-        eprintln!(
-            "  {}[PARSE]{} {}llm{}={}{}{} {}b64{}={}{}{} {}data{}={}{}{} {}forceImage{}={}{}{} {}fmt{}={}{:?}{} {}fence{}={}{:?}{} {}pos{}={}{:?}{}",
-            COLOR_TRACE, COLOR_RESET,
-            COLOR_INFO, COLOR_RESET, COLOR_TRACE, cfg.from_llm, COLOR_RESET,
-            COLOR_INFO, COLOR_RESET, COLOR_TRACE, cfg.as_b64, COLOR_RESET,
-            COLOR_INFO, COLOR_RESET, COLOR_TRACE, cfg.as_data, COLOR_RESET,
-            COLOR_INFO, COLOR_RESET, COLOR_TRACE, cfg.force_image, COLOR_RESET,
-            COLOR_INFO, COLOR_RESET, COLOR_TRACE, cfg.fmt, COLOR_RESET,
-            COLOR_INFO, COLOR_RESET, COLOR_TRACE, cfg.fence, COLOR_RESET,
-            COLOR_INFO, COLOR_RESET, COLOR_TRACE, cfg.positional, COLOR_RESET,
-        );
     }
 
     if cfg.diff {
@@ -261,29 +237,23 @@ fn main() {
                 cwd().join(p)
             };
 
-            diff::unified_diff(&cfg,
+            diff::unified_diff(
+                &cfg,
                 target
                     .file_name()
                     .unwrap_or_default()
                     .to_string_lossy()
                     .as_ref(),
+                false,
                 &text,
                 &target,
                 100,
             );
-
             process::exit(0);
         }
 
-        let items = bundle::parse_fence(&text, &cfg.fence);
-
-        // In main.rs right after `let items = bundle::parse_fence(&text, &cfg.fence);`:
-        let has_named = items.iter().any(|it| !it.name.starts_with("file_"));
-        let items: Vec<bundle::Rec> = if has_named {
-            items.into_iter().filter(|it| !it.name.starts_with("file_")).collect()
-        } else {
-            items
-        };
+        let raw_items = bundle::parse_fence(&text, &cfg.fence);
+        let items = bundle::filter_items(raw_items, cfg.include_unnamed);
 
         if items.is_empty() {
             let target = match &cfg.diff_target {
@@ -294,17 +264,18 @@ fn main() {
                 }
             };
 
-            diff::unified_diff(&cfg,
+            diff::unified_diff(
+                &cfg,
                 target
                     .file_name()
                     .unwrap_or_default()
                     .to_string_lossy()
                     .as_ref(),
+                false,
                 &text,
                 &target,
                 100,
             );
-
             process::exit(0);
         }
 
@@ -334,10 +305,6 @@ fn main() {
             let name = it.name.replace('\\', "/");
 
             if name.starts_with("../") || name.contains("/../") || name.contains(':') {
-                eprintln!(
-                    "{}Skipping unsafe path{}: {}{}{}",
-                    COLOR_WARNING, COLOR_RESET, COLOR_INFO, name, COLOR_RESET
-                );
                 skipped += 1;
                 continue;
             }
@@ -352,14 +319,9 @@ fn main() {
                 println!();
             }
 
-            diff::unified_diff(&cfg, &name, &it.content, &disk_path, 100);
+            diff::unified_diff(&cfg, &name, it.unnamed, &it.content, &disk_path, 100);
             diffed += 1;
         }
-
-        eprintln!(
-            "\n{}{} file(s) diffed{}, {}{} skipped{}.",
-            COLOR_DESC, diffed, COLOR_RESET, COLOR_WARNING, skipped, COLOR_RESET
-        );
 
         process::exit(if diffed > 0 { 0 } else { 1 });
     }
@@ -373,7 +335,8 @@ fn main() {
     {
         let text = clipboard::get_text().unwrap_or_default();
         if !text.trim().is_empty() {
-            let items = bundle::parse_fence(&text, &cfg.fence);
+            let raw_items = bundle::parse_fence(&text, &cfg.fence);
+            let items = bundle::filter_items(raw_items, cfg.include_unnamed);
 
             if cfg.positional.is_none() && !items.is_empty() && !cfg.from_llm {
                 preview_llm_items(&items);
@@ -384,11 +347,7 @@ fn main() {
                 let dest_path: PathBuf = match &cfg.positional {
                     Some(p) => {
                         let pb = PathBuf::from(p);
-                        if pb.is_absolute() {
-                            pb
-                        } else {
-                            cwd().join(pb)
-                        }
+                        if pb.is_absolute() { pb } else { cwd().join(pb) }
                     }
                     None => cwd(),
                 };
@@ -406,12 +365,7 @@ fn main() {
 
                 for it in &items {
                     let name = it.name.replace('\\', "/");
-
-                    if name.starts_with("../") || name.contains("/../") || name.contains(":") {
-                        eprintln!(
-                            "{}Skipping unsafe path{}: {}{}{}",
-                            COLOR_WARNING, COLOR_RESET, COLOR_INFO, name, COLOR_RESET
-                        );
+                    if name.starts_with("../") || name.contains("/../") || name.contains(':') {
                         continue;
                     }
 
@@ -422,23 +376,13 @@ fn main() {
                     };
 
                     ensure_parent(&out);
-
-                    match write_text(&out, &it.content) {
-                        Ok(()) => {
-                            println!("{}", out.display());
-                            written.push(out);
-                        }
-                        Err(e) => eprintln!(
-                            "{}Failed {}{}{}: {}{}{}",
-                            COLOR_ERROR, COLOR_INFO, out.display(), COLOR_RESET, COLOR_INFO, e, COLOR_RESET
-                        ),
+                    if write_text(&out, &it.content).is_ok() {
+                        println!("{}", out.display());
+                        written.push(out);
                     }
                 }
 
-                println!(
-                    "{}{} file(s) written{} {}LLM bundle{}.",
-                    COLOR_DESC, items.len(), COLOR_RESET, COLOR_INFO, COLOR_RESET
-                );
+                println!("{}{} file(s) written.", COLOR_DESC, written.len());
                 trace_summary(cfg.trace, &written);
                 process::exit(0);
             }
@@ -448,16 +392,10 @@ fn main() {
     let mut dest_path: PathBuf = match &cfg.positional {
         Some(p) => {
             let pb = PathBuf::from(p);
-            if pb.is_absolute() {
-                pb
-            } else {
-                cwd().join(pb)
-            }
+            if pb.is_absolute() { pb } else { cwd().join(pb) }
         }
         None => cwd(),
     };
-
-    let mut written: Vec<PathBuf> = Vec::new();
 
     if clipboard::has_format(clipboard::CF_HDROP) {
         let dropped = clipboard::get_file_drop().unwrap_or_default();
@@ -470,61 +408,18 @@ fn main() {
             }
         };
 
-        let fmt_override: Option<String> = cfg.fmt.clone().or_else(|| {
-            if !dest_path.is_dir() {
-                imgutil::ext_of(&dest_path.to_string_lossy())
-            } else {
-                None
-            }
-        });
-
         for src in &dropped {
             let src_path = Path::new(src);
-            let base = Path::new(&dropped[0])
-                .parent()
-                .unwrap_or_else(|| Path::new(""));
+            let base = Path::new(&dropped[0]).parent().unwrap_or_else(|| Path::new(""));
             let rel = src_path.strip_prefix(base).unwrap_or(src_path);
-
-            let src_ext = imgutil::ext_of(src);
-            let is_img = imgutil::is_image(src);
-
-            let converts =
-                is_img && fmt_override.is_some() && fmt_override.as_deref() != src_ext.as_deref();
-
-            if converts {
-                let target_ext = fmt_override.clone().unwrap();
-                let (ps_fmt, _m, _e) =
-                    imgutil::resolve_format(&format!("x.{}", target_ext), None);
-
-                let mut out2 = dest_dir.join(rel);
-                out2.set_extension(&target_ext);
-
-                ensure_parent(&out2);
-
-                match shim_transcode(src, &out2.to_string_lossy(), ps_fmt) {
-                    Ok(()) => {
-                        println!("{}  ({}converted to {}{})", rel.display(), COLOR_DESC, target_ext, COLOR_RESET);
-                        written.push(out2);
-                        continue;
-                    }
-                    Err(e) => eprintln!("{}Image conversion failed for '{}': {}{}", COLOR_ERROR, src, e, COLOR_RESET),
-                }
-            }
 
             let out = dest_dir.join(rel);
             ensure_parent(&out);
 
-            match fs::copy(src, &out) {
-                Ok(_) => {
-                    println!("{}", rel.display());
-                    written.push(out);
-                }
-                Err(e) => eprintln!("{}Copy failed for '{}': {}{}", COLOR_ERROR, src, e, COLOR_RESET),
+            if fs::copy(src, &out).is_ok() {
+                println!("{}", rel.display());
             }
         }
-
-        println!("{}{} file(s) pasted.{}", COLOR_DESC, dropped.len(), COLOR_RESET);
-        trace_summary(cfg.trace, &written);
         process::exit(0);
     }
 
@@ -554,70 +449,23 @@ fn main() {
         ensure_parent(&dest_path);
         let dest_s = dest_path.to_string_lossy().to_string();
 
-        let (mode, tail) = if cfg.as_b64 {
-            (
-                ImgMode::Base64,
-                format!("Image written as Base64 ({}) {}", ext.to_uppercase(), dest_s),
-            )
-        } else if cfg.as_data {
-            (
-                ImgMode::DataUri,
-                format!("Image written as HTML Base64 data URI ({}) {}", mime, dest_s),
-            )
-        } else {
-            (
-                ImgMode::Raw,
-                format!("Image written ({}) {}", ext.to_uppercase(), dest_s),
-            )
-        };
-
-        match shim_clipboard_image(mode, &dest_s, ps_fmt, &mime) {
-            Ok(()) => {
-                println!("{}", tail);
-                written.push(dest_path.clone());
-                trace_summary(cfg.trace, &written);
-                process::exit(0);
-            }
-            Err(e) => {
-                eprintln!("{}", e);
-                process::exit(1);
-            }
+        if shim_clipboard_image(ImgMode::Raw, &dest_s, ps_fmt, &mime).is_ok() {
+            println!("Image written ({}) {}", ext.to_uppercase(), dest_s);
+            process::exit(0);
         }
-    } else if want_image && !has_img {
-        eprintln!("Clipboard does not contain an image.");
         process::exit(1);
     }
 
     if clipboard::has_format(clipboard::CF_UNICODETEXT) {
         let text = clipboard::get_text().unwrap_or_default();
-
         if !skip_write {
-            match write_text(&dest_path, &text) {
-                Ok(()) => {
-                    println!("Text written {}", dest_path.display());
-                    written.push(dest_path.clone());
-                }
-                Err(e) => {
-                    eprintln!("Write failed: {}", e);
-                    process::exit(1);
-                }
-            }
+            let _ = write_text(&dest_path, &text);
+            println!("Text written {}", dest_path.display());
         } else {
-            println!();
-            println!("{}", text);
-            println!();
+            println!("\n{}\n", text);
         }
-
-        trace_summary(cfg.trace, &written);
         process::exit(0);
-    }
-
-    if has_img {
-        eprintln!("Clipboard holds an image; name an output file (e.g. clipout shot.png) or pass --i.");
-    } else {
-        eprintln!("Clipboard does not contain text, an image, or files.");
     }
 
     process::exit(1);
 }
-

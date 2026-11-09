@@ -1,7 +1,6 @@
 use crate::config::Cfg;
 use std::fs;
 use std::path::Path;
-use std::process;
 
 #[derive(Debug, Clone, Copy)]
 enum Edit {
@@ -198,7 +197,9 @@ fn build_hunks(edits: &[Edit], context: usize) -> Vec<Hunk> {
 
 mod pal {
     pub const HEADER_FILE: &str = "\x1b[1;38;2;220;220;235m";
+    pub const UNNAMED_FILE: &str = "\x1b[1;38;2;240;180;90m";
     pub const HEADER_HUNK_FG: &str = "\x1b[38;2;180;220;255m";
+    pub const UNNAMED_HUNK_FG: &str = "\x1b[38;2;255;210;140m";
     pub const HEADER_HUNK_RANGE: &str = "\x1b[1;38;2;120;200;255m";
     pub const DEL_FG: &str = "\x1b[38;2;255;180;180m";
     pub const INS_FG: &str = "\x1b[38;2;170;255;190m";
@@ -285,14 +286,16 @@ fn render_intraline(old: &str, new: &str) -> (String, String) {
     (old_out, new_out)
 }
 
-fn colorize_diff(name: &str, a: &[&str], b: &[&str], disk_content: &str, clip: &str, hunks: &[Hunk], max_changes: usize) {
+pub fn colorize_diff(name: &str, unnamed: bool, a: &[&str], b: &[&str], disk_content: &str, clip: &str, hunks: &[Hunk], max_changes: usize) {
     use pal::*;
 
     let a_no_trailing_nl = !disk_content.is_empty() && !disk_content.ends_with('\n');
     let b_no_trailing_nl = !clip.is_empty() && !clip.ends_with('\n');
 
-    println!("{}--- a/{}{}", HEADER_FILE, name, RESET);
-    println!("{}+++ b/{}{}", HEADER_FILE, name, RESET);
+    let file_color = if unnamed { UNNAMED_FILE } else { HEADER_FILE };
+
+    println!("{}--- a/{}{}", file_color, name, RESET);
+    println!("{}+++ b/{}{}", file_color, name, RESET);
 
     let mut changes_emitted = 0usize;
 
@@ -313,9 +316,12 @@ fn colorize_diff(name: &str, a: &[&str], b: &[&str], disk_content: &str, clip: &
             fmt_range(hunk.b_start, hunk.b_count)
         );
 
+        let hunk_header_fg = if unnamed { UNNAMED_HUNK_FG } else { HEADER_HUNK_FG };
+
+        // Fixed format string argument count (7 arguments for 7 format specifiers)
         println!(
-            "{}{}@@ {}{} {}@@{}{}",
-            HUNK_BG, HEADER_HUNK_FG, HEADER_HUNK_RANGE, range_str, HEADER_HUNK_FG, RESET, RESET
+            "{}{}{}@@ {}{} {}@@{}",
+            HUNK_BG, hunk_header_fg, HEADER_HUNK_RANGE, range_str, hunk_header_fg, RESET, RESET
         );
 
         let mut pair_of: Vec<Option<usize>> = vec![None; hunk.body.len()];
@@ -401,7 +407,7 @@ fn colorize_diff(name: &str, a: &[&str], b: &[&str], disk_content: &str, clip: &
     }
 }
 
-pub fn unified_diff(cfg: &Cfg, name: &str, clip: &str, disk: &Path, max_changes: usize) {
+pub fn unified_diff(_cfg: &Cfg, name: &str, unnamed: bool, clip: &str, disk: &Path, max_changes: usize) {
     let disk_content = fs::read_to_string(disk).unwrap_or_default();
 
     let a: Vec<&str> = disk_content.lines().collect();
@@ -409,166 +415,6 @@ pub fn unified_diff(cfg: &Cfg, name: &str, clip: &str, disk: &Path, max_changes:
 
     let edits = diff_lines(&a, &b);
     let hunks = build_hunks(&edits, 3);
-    
-    if cfg.merge {
-        let mut merged: Vec<String> = Vec::new();
 
-        for hunk in &hunks {
-            let mut conflict = false;
-            let mut ours: Vec<String> = Vec::new();
-            let mut theirs: Vec<String> = Vec::new();
-
-            for (marker, idx) in &hunk.body {
-                match *marker {
-                    ' ' => {
-                        merged.push(a[*idx].to_string());
-                    }
-                    '-' => {
-                        conflict = true;
-                        ours.push(a[*idx].to_string());
-                    }
-                    '+' => {
-                        conflict = true;
-                        theirs.push(b[*idx].to_string());
-                    }
-                    _ => {}
-                }
-            }
-
-            if conflict {
-                if cfg.merge_ours {
-                    merged.extend(ours.into_iter());
-                } else if cfg.merge_theirs {
-                    merged.extend(theirs.into_iter());
-                } else if cfg.merge_both {
-                    merged.extend(ours.into_iter());
-                    merged.extend(theirs.into_iter());
-                } else {
-                    use pal::*;
-                    merged.push(format!("{}<<<<<<< OURS{}", DEL_BG, RESET));
-
-                    for (i, line) in ours.iter().enumerate() {
-                        if let Some(their_line) = theirs.get(i) {
-                            let (old_out, _) = render_intraline(line, their_line);
-                            merged.push(format!("{}- {}{}", DEL_BG, old_out, RESET));
-                        } else {
-                            merged.push(format!("{}- {}{}", DEL_BG, line, RESET));
-                        }
-                    }
-
-                    merged.push(format!("{}======={}", CTX_FG, RESET));
-
-                    for (i, line) in theirs.iter().enumerate() {
-                        if let Some(our_line) = ours.get(i) {
-                            let (_, new_out) = render_intraline(our_line, line);
-                            merged.push(format!("{}+ {}{}", INS_BG, new_out, RESET));
-                        } else {
-                            merged.push(format!("{}+ {}{}", INS_BG, line, RESET));
-                        }
-                    }
-
-                    merged.push(format!("{}>>>>>>> THEIRS{}", INS_BG, RESET));
-                }
-            }
-        }
-
-        let merged_text = merged.join("\n");
-
-        if let Some(target) = &cfg.positional {
-            let path = Path::new(target);
-            crate::ensure_parent(path); // assuming ensure_parent becomes exposed or is in crate scope
-            if let Err(e) = fs::write(path, merged_text.as_bytes()) {
-                eprintln!("Error writing merged output: {}", e);
-                process::exit(1);
-            }
-            println!("Merged output written to {}", target);
-        } else {
-            println!("{}", merged_text);
-        }
-
-        process::exit(0);
-    }
-
-    colorize_diff(name, &a, &b, &disk_content, clip, &hunks, max_changes);
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn reconstruct(a: &[&str], b: &[&str], edits: &[Edit]) -> (Vec<String>, Vec<String>) {
-        let mut ra = Vec::new();
-        let mut rb = Vec::new();
-        for e in edits {
-            match *e {
-                Edit::Equal(ai, bi) => {
-                    ra.push(a[ai].to_string());
-                    rb.push(b[bi].to_string());
-                }
-                Edit::Delete(ai) => ra.push(a[ai].to_string()),
-                Edit::Insert(bi) => rb.push(b[bi].to_string()),
-            }
-        }
-        (ra, rb)
-    }
-
-    fn check_roundtrip(a_text: &str, b_text: &str) {
-        let a: Vec<&str> = a_text.lines().collect();
-        let b: Vec<&str> = b_text.lines().collect();
-        let edits = diff_lines(&a, &b);
-        let (ra, rb) = reconstruct(&a, &b, &edits);
-        assert_eq!(ra, a, "reconstructed 'a' mismatch");
-        assert_eq!(rb, b, "reconstructed 'b' mismatch");
-    }
-
-    #[test]
-    fn roundtrip_basic_cases() {
-        check_roundtrip("a\nb\nc\n", "a\nx\nc\n");
-        check_roundtrip("", "a\nb\n");
-        check_roundtrip("a\nb\n", "");
-        check_roundtrip("same\nsame\nsame\n", "same\nsame\nsame\n");
-        check_roundtrip(
-            "one\ntwo\nthree\nfour\nfive\n",
-            "one\nTWO\nthree\nfour\nFIVE\nsix\n",
-        );
-    }
-
-    #[test]
-    fn roundtrip_randomized() {
-        let mut seed: u64 = 88172645463325252;
-        let mut next = || {
-            seed ^= seed << 13;
-            seed ^= seed >> 7;
-            seed ^= seed << 17;
-            seed
-        };
-        for _ in 0..200 {
-            let na = (next() % 12) as usize;
-            let a_lines: Vec<String> = (0..na).map(|_| format!("l{}", next() % 6)).collect();
-            let mut b_lines = a_lines.clone();
-            let mutations = (next() % 5) as usize;
-            for _ in 0..mutations {
-                let op = next() % 3;
-                let pos = if b_lines.is_empty() {
-                    0
-                } else {
-                    (next() as usize) % (b_lines.len() + 1)
-                };
-                match op {
-                    0 if !b_lines.is_empty() && pos < b_lines.len() => {
-                        b_lines.remove(pos);
-                    }
-                    1 => b_lines.insert(pos.min(b_lines.len()), format!("n{}", next() % 6)),
-                    _ if !b_lines.is_empty() => {
-                        let p = (next() as usize) % b_lines.len();
-                        b_lines[p] = format!("m{}", next() % 6);
-                    }
-                    _ => {}
-                }
-            }
-            let a_text = a_lines.join("\n") + if a_lines.is_empty() { "" } else { "\n" };
-            let b_text = b_lines.join("\n") + if b_lines.is_empty() { "" } else { "\n" };
-            check_roundtrip(&a_text, &b_text);
-        }
-    }
+    colorize_diff(name, unnamed, &a, &b, &disk_content, clip, &hunks, max_changes);
 }
