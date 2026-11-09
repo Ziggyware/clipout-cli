@@ -277,6 +277,14 @@ fn main() {
 
         let items = bundle::parse_fence(&text, &cfg.fence);
 
+        // In main.rs right after `let items = bundle::parse_fence(&text, &cfg.fence);`:
+        let has_named = items.iter().any(|it| !it.name.starts_with("file_"));
+        let items: Vec<bundle::Rec> = if has_named {
+            items.into_iter().filter(|it| !it.name.starts_with("file_")).collect()
+        } else {
+            items
+        };
+
         if items.is_empty() {
             let target = match &cfg.diff_target {
                 Some(p) => PathBuf::from(p),
@@ -612,3 +620,4 @@ fn main() {
 
     process::exit(1);
 }
+
